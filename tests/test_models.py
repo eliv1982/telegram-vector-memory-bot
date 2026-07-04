@@ -13,6 +13,7 @@ from telegram_vector_memory_bot.models import (
     MemoryReason,
     MemoryRecord,
     MemoryWriteResult,
+    RecalledMemory,
     VectorMatch,
 )
 
@@ -285,3 +286,89 @@ def test_vector_match_score_boundary_values_accepted(score: float) -> None:
     match = VectorMatch(vector_id="mem-1", score=score)
 
     assert match.score == score
+
+
+def test_valid_recalled_memory() -> None:
+    memory = RecalledMemory(
+        memory_id="mem-1",
+        text="Я предпочитаю короткие ответы.",
+        score=0.95,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        source="telegram",
+        content_hash="abc123",
+        username="jdoe",
+        first_name="Jane",
+        last_name="Doe",
+    )
+
+    assert memory.memory_id == "mem-1"
+    assert memory.score == 0.95
+
+
+def test_recalled_memory_optional_telegram_fields_default_to_none() -> None:
+    memory = RecalledMemory(
+        memory_id="mem-1",
+        text="Пиши мне кратко и по существу.",
+        score=0.5,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        source="telegram",
+        content_hash="abc123",
+    )
+
+    assert memory.username is None
+    assert memory.first_name is None
+    assert memory.last_name is None
+
+
+@pytest.mark.parametrize("field", ["memory_id", "text", "source", "content_hash"])
+def test_recalled_memory_empty_required_field_rejected(field: str) -> None:
+    data = {
+        "memory_id": "mem-1",
+        "text": "Пиши мне кратко и по существу.",
+        "score": 0.5,
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "source": "telegram",
+        "content_hash": "abc123",
+    }
+    data[field] = "   "
+
+    with pytest.raises(ValidationError):
+        RecalledMemory(**data)
+
+
+@pytest.mark.parametrize("score", [-1.01, 1.01])
+def test_recalled_memory_score_out_of_range_rejected(score: float) -> None:
+    with pytest.raises(ValidationError):
+        RecalledMemory(
+            memory_id="mem-1",
+            text="Пиши мне кратко и по существу.",
+            score=score,
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            source="telegram",
+            content_hash="abc123",
+        )
+
+
+def test_recalled_memory_naive_datetime_rejected() -> None:
+    with pytest.raises(ValidationError):
+        RecalledMemory(
+            memory_id="mem-1",
+            text="Пиши мне кратко и по существу.",
+            score=0.5,
+            created_at=datetime(2026, 1, 1),
+            source="telegram",
+            content_hash="abc123",
+        )
+
+
+def test_recalled_memory_extra_fields_forbidden() -> None:
+    with pytest.raises(ValidationError):
+        RecalledMemory(
+            memory_id="mem-1",
+            text="Пиши мне кратко и по существу.",
+            score=0.5,
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            source="telegram",
+            content_hash="abc123",
+            bot_response="this field does not exist",
+        )

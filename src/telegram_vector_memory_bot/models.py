@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class MemoryAction(StrEnum):
@@ -118,4 +118,38 @@ class VectorMatch(BaseModel):
     def _validate_vector_match(self) -> VectorMatch:
         if not self.vector_id.strip():
             raise ValueError("vector_id must not be empty")
+        return self
+
+
+class RecalledMemory(BaseModel):
+    """A single memory retrieved from the vector store for recall.
+
+    Deliberately excludes any bot response text -- only user-provided
+    memories are ever recalled and surfaced back to the caller.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: str
+    text: str
+    score: float = Field(ge=-1.0, le=1.0)
+    created_at: datetime
+    source: str
+    content_hash: str
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_recalled_memory(self) -> RecalledMemory:
+        if not self.memory_id.strip():
+            raise ValueError("memory_id must not be empty")
+        if not self.text.strip():
+            raise ValueError("text must not be empty or whitespace-only")
+        if not self.source.strip():
+            raise ValueError("source must not be empty")
+        if not self.content_hash.strip():
+            raise ValueError("content_hash must not be empty or whitespace-only")
+        if self.created_at.tzinfo is None:
+            raise ValueError("created_at must be timezone-aware")
         return self
