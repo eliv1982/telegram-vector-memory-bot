@@ -48,7 +48,7 @@ class Settings(BaseSettings):
 
     TELEGRAM_BOT_TOKEN: SecretStr
 
-    MEMORY_SIMILARITY_THRESHOLD: float = Field(default=0.90, ge=0.0, le=1.0)
+    MEMORY_SIMILARITY_THRESHOLD: float = Field(default=0.50, ge=0.0, le=1.0)
     MEMORY_TOP_K: int = Field(default=5, ge=1, le=20)
     MEMORY_NAMESPACE_PREFIX: str = "telegram-user"
 

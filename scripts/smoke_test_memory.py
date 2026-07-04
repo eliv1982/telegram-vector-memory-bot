@@ -10,11 +10,19 @@ The default ``--user-id`` (900000001) is a synthetic placeholder, not a real
 Telegram user ID. All data for the given user ID is removed both before and
 after the run, so the namespace is left exactly as it was found.
 
+Pinecone is eventually consistent: an acknowledged upsert or delete does not
+guarantee that a subsequent fetch/query immediately reflects it. This script
+polls each read-after-write and read-after-delete boundary with a bounded
+timeout (``--consistency-timeout`` / ``--poll-interval``) instead of a single
+immediate check -- it never calls ``remember()`` again or reinserts a memory
+while waiting for visibility.
+
 Usage::
 
     python scripts/smoke_test_memory.py
     python scripts/smoke_test_memory.py --require-semantic-skip
     python scripts/smoke_test_memory.py --user-id 900000042
+    python scripts/smoke_test_memory.py --consistency-timeout 30 --poll-interval 2
 """
 
 from __future__ import annotations
@@ -22,14 +30,32 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from typing import Any
+import time
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from telegram_vector_memory_bot.config import get_settings
 from telegram_vector_memory_bot.memory_service import MemoryService, MemoryServiceError
-from telegram_vector_memory_bot.models import MemoryAction, MemoryReason, MemoryWriteResult
+from telegram_vector_memory_bot.models import (
+    MemoryAction,
+    MemoryReason,
+    MemoryWriteResult,
+    RecalledMemory,
+    VectorMatch,
+)
 from telegram_vector_memory_bot.pinecone_manager import PineconeManager, VectorMemoryError
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# Mirrors MemoryService's own internal filter for stored user memories, so
+# this script's visibility polling checks the same record type recall() and
+# remember()'s duplicate lookup actually query.
+_MEMORY_RECORD_TYPE_FILTER = {"record_type": {"$eq": "user_memory"}}
+
+DEFAULT_CONSISTENCY_TIMEOUT = 20.0
+DEFAULT_POLL_INTERVAL = 1.0
 
 # A reserved, clearly-synthetic Telegram user ID block. Real Telegram user IDs
 # in current use are well below this range, so rejecting IDs outside of it
@@ -49,6 +75,10 @@ _LABEL_LIMIT = 40
 
 class SmokeTestError(Exception):
     """Raised when a live smoke-test expectation is not met."""
+
+
+class SmokeTestVisibilityTimeoutError(SmokeTestError):
+    """An expected read-after-write/delete visibility never occurred in time."""
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -78,6 +108,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "skipped/semantic_duplicate under the current threshold."
         ),
     )
+    parser.add_argument(
+        "--consistency-timeout",
+        type=float,
+        default=DEFAULT_CONSISTENCY_TIMEOUT,
+        help=(
+            "Maximum seconds to wait for a write or delete to become visible "
+            f"before failing (default: {DEFAULT_CONSISTENCY_TIMEOUT})."
+        ),
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_POLL_INTERVAL,
+        help=(
+            "Seconds to wait between visibility polling attempts "
+            f"(default: {DEFAULT_POLL_INTERVAL})."
+        ),
+    )
     return parser
 
 
@@ -92,6 +140,42 @@ def validate_user_id(user_id: int) -> None:
             f"{_MAX_SYNTHETIC_USER_ID}); refusing to risk touching a real "
             "Telegram user's namespace"
         )
+
+
+def _validate_consistency_arguments(consistency_timeout: float, poll_interval: float) -> None:
+    """Validate the shared consistency-polling CLI options."""
+    if not (consistency_timeout > 0):
+        raise SmokeTestError("--consistency-timeout must be a positive number")
+    if not (poll_interval > 0):
+        raise SmokeTestError("--poll-interval must be a positive number")
+    if poll_interval > consistency_timeout:
+        raise SmokeTestError("--poll-interval must not be greater than --consistency-timeout")
+
+
+def _poll_until(
+    check: Callable[[], _T | None],
+    *,
+    consistency_timeout: float,
+    poll_interval: float,
+    description: str,
+) -> _T:
+    """Poll *check* until it returns a non-``None`` result or the timeout elapses.
+
+    *check* must be non-mutating. Between attempts this sleeps
+    *poll_interval* seconds; the deadline is measured with
+    ``time.monotonic()`` so it is immune to system clock changes.
+    """
+    deadline = time.monotonic() + consistency_timeout
+    while True:
+        result = check()
+        if result is not None:
+            return result
+        if time.monotonic() >= deadline:
+            raise SmokeTestVisibilityTimeoutError(
+                f"timed out after {consistency_timeout}s waiting for {description}"
+            )
+        logger.info("Not yet visible, retrying: %s", description)
+        time.sleep(poll_interval)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -116,7 +200,13 @@ def _short_label(text: str, limit: int = _LABEL_LIMIT) -> str:
 
 
 def run_smoke_test(
-    service: MemoryService, *, user_id: int, require_semantic_skip: bool
+    service: MemoryService,
+    manager: PineconeManager,
+    *,
+    user_id: int,
+    require_semantic_skip: bool,
+    consistency_timeout: float = DEFAULT_CONSISTENCY_TIMEOUT,
+    poll_interval: float = DEFAULT_POLL_INTERVAL,
 ) -> dict[str, Any]:
     """Run the live scenario for *user_id*, always cleaning up afterwards.
 
@@ -124,9 +214,18 @@ def run_smoke_test(
     previous interrupted run) and in a ``finally`` block afterwards, so a
     failure partway through never leaves synthetic data behind. A cleanup
     failure is logged but never replaces an original scenario failure.
+
+    Pinecone is eventually consistent, so every read-after-write and
+    read-after-delete boundary is bounded-polled for visibility rather than
+    checked once immediately -- see ``_poll_until``.
     """
     logger.info("Using synthetic user namespace")
+    namespace = service.namespace_for_user(user_id)
     service.forget_user(user_id=user_id)
+
+    def _check_recall_empty() -> list[RecalledMemory] | None:
+        results = service.recall(user_id=user_id, query=RECALL_QUERY_TEXT)
+        return results if len(results) == 0 else None
 
     summary: dict[str, Any] = {}
     try:
@@ -138,6 +237,19 @@ def run_smoke_test(
             f"{first_write.action}/{first_write.reason}",
         )
         summary["first_write"] = _result_summary(first_write)
+        first_memory_id = first_write.memory_id
+        assert first_memory_id is not None  # guaranteed by MemoryWriteResult for INSERTED
+
+        def _check_first_memory_fetch_visible() -> dict[str, dict[str, Any]] | None:
+            existing = manager.fetch_vectors(vector_ids=[first_memory_id], namespace=namespace)
+            return existing if first_memory_id in existing else None
+
+        _poll_until(
+            _check_first_memory_fetch_visible,
+            consistency_timeout=consistency_timeout,
+            poll_interval=poll_interval,
+            description="first memory to become fetch-visible",
+        )
 
         exact_duplicate = service.remember(user_id=user_id, text=SHORT_ANSWERS_TEXT)
         _require(
@@ -147,6 +259,28 @@ def run_smoke_test(
             f"{exact_duplicate.action}/{exact_duplicate.reason}",
         )
         summary["exact_duplicate"] = _result_summary(exact_duplicate)
+
+        # The first memory's embedding is created exactly once here and reused
+        # across every polling attempt below -- never recreated per attempt.
+        first_memory_query_embedding = manager.create_embedding(SHORT_ANSWERS_TEXT)
+
+        def _check_first_memory_query_visible() -> list[VectorMatch] | None:
+            matches = manager.query_by_vector(
+                values=first_memory_query_embedding,
+                namespace=namespace,
+                top_k=1,
+                metadata_filter=_MEMORY_RECORD_TYPE_FILTER,
+            )
+            if matches and matches[0].vector_id == first_memory_id:
+                return matches
+            return None
+
+        _poll_until(
+            _check_first_memory_query_visible,
+            consistency_timeout=consistency_timeout,
+            poll_interval=poll_interval,
+            description="first memory to become query-visible",
+        )
 
         paraphrase = service.remember(user_id=user_id, text=PARAPHRASE_TEXT)
         if require_semantic_skip:
@@ -167,8 +301,16 @@ def run_smoke_test(
         )
         summary["different_memory"] = _result_summary(different_memory)
 
-        recalled = service.recall(user_id=user_id, query=RECALL_QUERY_TEXT)
-        _require(len(recalled) >= 1, "expected recall to return at least one result")
+        def _check_recall_populated() -> list[RecalledMemory] | None:
+            results = service.recall(user_id=user_id, query=RECALL_QUERY_TEXT)
+            return results if len(results) >= 1 else None
+
+        recalled = _poll_until(
+            _check_recall_populated,
+            consistency_timeout=consistency_timeout,
+            poll_interval=poll_interval,
+            description="recall to return at least one result",
+        )
         summary["recall_count"] = len(recalled)
         summary["recall_results"] = [
             {"memory_id": m.memory_id, "score": m.score, "label": _short_label(m.text)}
@@ -176,12 +318,23 @@ def run_smoke_test(
         ]
 
         service.forget_user(user_id=user_id)
-        post_forget_recall = service.recall(user_id=user_id, query=RECALL_QUERY_TEXT)
-        _require(len(post_forget_recall) == 0, "expected recall after forget_user to be empty")
+        _poll_until(
+            _check_recall_empty,
+            consistency_timeout=consistency_timeout,
+            poll_interval=poll_interval,
+            description="recall to become empty after forget_user",
+        )
         summary["cleanup_verified"] = True
     finally:
         try:
             service.forget_user(user_id=user_id)
+            _poll_until(
+                _check_recall_empty,
+                consistency_timeout=consistency_timeout,
+                poll_interval=poll_interval,
+                description="recall to become empty after safety-net forget_user",
+            )
+            summary["cleanup_verified"] = True
         except Exception:
             logger.exception("Safety-net cleanup (forget_user) failed")
             summary["cleanup_verified"] = False
@@ -197,8 +350,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         validate_user_id(args.user_id)
+        _validate_consistency_arguments(args.consistency_timeout, args.poll_interval)
     except SmokeTestError as exc:
-        logger.error("Invalid --user-id: %s", exc)
+        logger.error("Invalid arguments: %s", exc)
         return 2
 
     settings = get_settings()
@@ -208,8 +362,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         summary = run_smoke_test(
             service,
+            manager,
             user_id=args.user_id,
             require_semantic_skip=args.require_semantic_skip,
+            consistency_timeout=args.consistency_timeout,
+            poll_interval=args.poll_interval,
         )
     except (SmokeTestError, VectorMemoryError, MemoryServiceError) as exc:
         logger.error("Smoke test failed: %s", exc)

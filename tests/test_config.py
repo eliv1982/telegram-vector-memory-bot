@@ -51,7 +51,7 @@ def test_settings_created_from_environment(monkeypatch: pytest.MonkeyPatch) -> N
     assert settings.PINECONE_INDEX_NAME == "test-index"
     assert settings.OPENAI_CHAT_MODEL == "gpt-4o-mini"
     assert settings.OPENAI_EMBEDDING_MODEL == "text-embedding-3-small"
-    assert settings.MEMORY_SIMILARITY_THRESHOLD == 0.90
+    assert settings.MEMORY_SIMILARITY_THRESHOLD == 0.50
     assert settings.MEMORY_TOP_K == 5
     assert settings.MEMORY_NAMESPACE_PREFIX == "telegram-user"
     assert settings.LOG_LEVEL == "INFO"

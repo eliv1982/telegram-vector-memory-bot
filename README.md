@@ -165,6 +165,37 @@ section below) and fill in real `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`,
 `OPENAI_API_KEY`, and `OPENAI_CHAT_MODEL`. **Never commit `.env`** -- it is
 already excluded via `.gitignore`.
 
+### Eventual consistency: bounded visibility polling
+
+Pinecone is **eventually consistent**: an acknowledged upsert or delete does
+not guarantee that a subsequent query or fetch immediately reflects it. A
+live calibration run once observed exactly this -- a reference upsert was
+acknowledged, the immediate filtered query returned zero matches, and
+cleanup still completed successfully. That is not a semantic-score failure;
+it is a timing gap between write acknowledgment and read visibility.
+
+Both scripts handle every read-after-write and read-after-delete boundary
+with **bounded polling** instead of a single immediate check or a fixed
+sleep: they re-issue the same read (never a new upsert, and never a
+recreated embedding) at a configurable interval until it succeeds or a
+configurable timeout elapses.
+
+```bash
+python scripts/calibrate_similarity.py --consistency-timeout 30 --poll-interval 2
+python scripts/smoke_test_memory.py --consistency-timeout 30 --poll-interval 2
+```
+
+- `--consistency-timeout` (default `20.0` seconds): the maximum time to wait
+  for visibility before failing with a clear, non-zero exit code.
+- `--poll-interval` (default `1.0` second): the pause between polling
+  attempts. Must be positive and no greater than `--consistency-timeout`.
+
+This retry handling only affects *when* a read is trusted -- it never
+changes a semantic score, the duplicate threshold, or the deduplication
+policy itself. A reported score is always the Pinecone-returned score from
+the query that first observed the write; nothing here re-derives or
+adjusts it.
+
 ### Calibration: measuring real cosine scores
 
 `scripts/calibrate_similarity.py` embeds four fixed, realistic
@@ -179,11 +210,48 @@ the script exits, regardless of success or failure.
 python scripts/calibrate_similarity.py
 ```
 
-The script's `suggested_threshold_range` output is **descriptive only** --
-a single observed score never proves semantic equivalence on its own.
-Choosing `MEMORY_SIMILARITY_THRESHOLD` requires human judgment across
-repeated runs and real usage, not one script's numbers; it is not a
-universal constant to copy verbatim into `.env`.
+After each reference upsert, the script polls the same exact `pair_id`
+filtered query -- bounded by `--consistency-timeout` / `--poll-interval` --
+until exactly one match appears, never recreating the reference or
+candidate embedding and never repeating the upsert while it waits. More
+than one match is treated as a malformed calibration state and fails
+immediately, without retrying. If no match ever becomes visible, the script
+raises a visibility timeout error and still cleans up the temporary
+namespace before exiting.
+
+The script's `calibration_interpretation` output labels each pair
+positive/duplicate-like (`A_likely_paraphrase`, `B_related_preference`) or
+negative/should-remain-separate (`C_potential_conflict`, `D_unrelated`) by
+its fixed category -- never by its own score -- then reports
+`minimum_positive_score`, `maximum_negative_score`, and whether
+`separation_exists` (every negative score below every positive score) for
+*this run*. When it does, `candidate_threshold_interval` is the half-open
+interval `(maximum_negative_score, minimum_positive_score]` implied by that
+run's numbers. When it doesn't, `candidate_threshold_interval` is `null` and
+the note says plainly that no single cosine threshold separates that run's
+examples -- the script never fabricates a recommendation from data that
+doesn't support one.
+
+One live calibration run against `text-embedding-3-small` did show
+separation: both positive-labeled pairs scored higher than both
+negative-labeled pairs, producing an approximate working interval of
+roughly **0.40 to 0.51**. `MEMORY_SIMILARITY_THRESHOLD` defaults to **0.50**
+in `.env.example` for that reason -- it sits inside that observed interval,
+close to the boundary shared with the lowest-scoring positive example. The
+report's `selected_project_threshold` field always reflects the live,
+currently configured `Settings.MEMORY_SIMILARITY_THRESHOLD` value (never a
+value hardcoded independently of it), and calibration never edits `.env`
+itself -- choosing and applying a threshold stays a manual, human step.
+
+This default is specific to the current embedding model
+(`text-embedding-3-small`) and to this project's small, fixed calibration
+scenario -- it is not a universal constant. A single cosine threshold also
+cannot be expected to distinguish every merely *related* fact from a true
+duplicate in every case (see `C_potential_conflict`, which is related but
+should never be silently merged with its reference). Recalibrate -- rerun
+`calibrate_similarity.py` and re-review its interpretation -- whenever the
+embedding model changes, or whenever the memory deduplication policy
+changes in a way that could shift what "duplicate enough" means.
 
 ### Smoke test: end-to-end MemoryService validation
 
@@ -203,6 +271,17 @@ the paraphrase step was classified as a new memory instead of a semantic
 duplicate under the current threshold -- that classification is exactly
 what calibration is for. With the flag, the paraphrase step **must** be
 classified as `skipped/semantic_duplicate`, or the script fails.
+
+Every read-after-write and read-after-delete boundary is bounded-polled
+before the script trusts it: the first memory must become fetch-visible
+before the exact-duplicate check, and query-visible before the paraphrase
+step; recall must return at least one result before it is required, and
+recall after `forget_user` must become empty (a single stale, non-empty
+recall result right after deletion is not treated as a cleanup failure).
+The `finally`-block safety net still always runs; if the main scenario
+already failed and the safety net's own cleanup also times out, the
+original scenario failure is what the script reports -- the safety net's
+failure is logged, never substituted in its place.
 
 ### Still pending
 
