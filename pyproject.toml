@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-vector-memory-bot"
+version = "0.1.0"
+description = "Telegram bot with long-term vector memory in Pinecone, semantic deduplication, and per-user namespace isolation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "telegram-vector-memory-bot contributors" }]
+
+dependencies = [
+    "pinecone>=9.1,<10",
+    "openai>=2.44,<3",
+    "pyTelegramBotAPI>=4.34,<5",
+    "pydantic>=2.11,<3",
+    "pydantic-settings>=2.14,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/telegram_vector_memory_bot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=telegram_vector_memory_bot --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["telegram_vector_memory_bot"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
