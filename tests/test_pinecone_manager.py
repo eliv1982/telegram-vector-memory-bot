@@ -427,6 +427,29 @@ def test_openai_base_url_omitted_when_not_configured(
     assert captured["api_key"] == "test-openai-key"
 
 
+def test_openai_base_url_omitted_when_normalized_to_none(
+    monkeypatch: pytest.MonkeyPatch, fake_pinecone: FakePineconeClient
+) -> None:
+    # Settings normalizes an empty OPENAI_BASE_URL (as in .env.example) to
+    # None; PineconeManager must still omit base_url in that case.
+    captured: dict[str, Any] = {}
+
+    class FakeOpenAIConstructor:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.embeddings = FakeOpenAIEmbeddings(_embedding_response())
+
+    monkeypatch.setattr(pinecone_manager, "OpenAI", FakeOpenAIConstructor)
+    settings = _build_settings(OPENAI_BASE_URL="")
+
+    assert settings.OPENAI_BASE_URL is None
+
+    PineconeManager(settings, pinecone_client=fake_pinecone)
+
+    assert "base_url" not in captured
+    assert captured["api_key"] == "test-openai-key"
+
+
 def test_secrets_unwrapped_only_for_client_construction(
     monkeypatch: pytest.MonkeyPatch, fake_pinecone: FakePineconeClient
 ) -> None:

@@ -7,6 +7,7 @@ monkeypatched environment variables, so no real user .env file is ever read.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -23,7 +24,13 @@ REQUIRED_ENV: dict[str, str] = {
 
 
 @pytest.fixture(autouse=True)
-def _clear_settings_cache() -> Iterator[None]:
+def _clear_settings_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    # get_settings() uses Settings()'s default env_file=".env", relative to the
+    # current working directory. Chdir into an empty tmp_path so a real,
+    # developer-local .env (e.g. one set up for the live Stage 4A scripts)
+    # never leaks into these tests, even for the two tests below that call
+    # get_settings() directly instead of Settings(_env_file=None).
+    monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -91,9 +98,26 @@ def test_empty_index_name_rejected(monkeypatch: pytest.MonkeyPatch, index_name: 
         Settings(_env_file=None)
 
 
-def test_openai_base_url_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_base_url_absent_becomes_none(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_required_env(monkeypatch)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.OPENAI_BASE_URL is None
+
+
+def test_openai_base_url_empty_string_becomes_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Matches .env.example's intentionally empty `OPENAI_BASE_URL=` line.
+    _set_required_env(monkeypatch, OPENAI_BASE_URL="")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.OPENAI_BASE_URL is None
+
+
+def test_openai_base_url_whitespace_only_becomes_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch, OPENAI_BASE_URL="   ")
 
     settings = Settings(_env_file=None)
 
@@ -106,6 +130,19 @@ def test_valid_openai_base_url_is_accepted(monkeypatch: pytest.MonkeyPatch) -> N
     settings = Settings(_env_file=None)
 
     assert settings.OPENAI_BASE_URL == "https://api.openai.com/v1"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["not-a-url", "ftp://api.openai.com", "http://", "https://", "just some text"],
+)
+def test_malformed_openai_base_url_rejected(
+    monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    _set_required_env(monkeypatch, OPENAI_BASE_URL=base_url)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 @pytest.mark.parametrize("prefix", ["bad prefix", "bad/prefix", "bad.prefix", ""])

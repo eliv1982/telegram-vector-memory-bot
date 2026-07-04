@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
+from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +22,11 @@ def _require_non_blank(value: str, field_name: str) -> str:
     if not value.strip():
         raise ValueError(f"{field_name} must not be empty or whitespace-only")
     return value
+
+
+def _looks_like_base_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 class Settings(BaseSettings):
@@ -52,13 +59,22 @@ class Settings(BaseSettings):
     def _validate_non_blank(cls, value: str, info: ValidationInfo) -> str:
         return _require_non_blank(value, info.field_name or "value")
 
-    @field_validator("OPENAI_BASE_URL")
+    @field_validator("OPENAI_BASE_URL", mode="before")
     @classmethod
-    def _validate_optional_base_url(cls, value: str | None) -> str | None:
-        if value is None:
+    def _normalize_optional_base_url(cls, value: Any) -> Any:
+        """Treat missing, empty, and whitespace-only values as unset (None).
+
+        This field alone is optional and blank-tolerant, matching
+        ``.env.example``'s intentionally empty ``OPENAI_BASE_URL=`` line for
+        the documented direct-OpenAI configuration. A non-blank value must
+        still be a well-formed http(s) URL.
+        """
+        if value is None or not isinstance(value, str):
             return value
         if not value.strip():
-            raise ValueError("OPENAI_BASE_URL must not be empty or whitespace-only")
+            return None
+        if not _looks_like_base_url(value):
+            raise ValueError("OPENAI_BASE_URL must be a valid http(s) URL")
         return value
 
     @field_validator("MEMORY_NAMESPACE_PREFIX")

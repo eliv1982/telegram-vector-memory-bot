@@ -41,7 +41,8 @@ so that repeated or paraphrased facts do not create redundant memories.
 
 ## Project status
 
-**Stage 3: memory policy and application-level memory service.**
+**Stage 4A: live calibration and smoke-test tooling, on top of Stage 3's
+memory policy and application-level memory service.**
 
 Stages 1-2 established the project skeleton, typed configuration, domain
 models, and `PineconeManager`. Stage 3 adds two new layers on top:
@@ -134,11 +135,80 @@ deduplication only ever cares about positive similarity.
 
 ### What's still pending
 
-Telegram integration (handlers, bot commands, chat completion) and live
-end-to-end validation against real Pinecone/OpenAI credentials have **not**
+Telegram integration (handlers, bot commands, chat completion) has **not**
 been implemented yet. The bot is not runnable as a Telegram bot at this
-stage -- only the storage, policy, and application layers exist and are
-covered by unit tests against fakes/mocks.
+stage -- only the storage, policy, and application layers exist.
+
+## Stage 4A: live calibration and smoke-test tooling
+
+Stage 4A adds two small, standalone operator scripts under `scripts/` that
+make **real** Pinecone and OpenAI API calls -- unlike every other layer in
+this project, which is covered purely by offline unit tests against
+fakes/mocks. Both scripts only construct `Settings` / `PineconeManager` /
+`MemoryService` inside their `main()` function, never at import time, and
+both clean up every piece of data they write, in a `finally` block, even on
+partial failure. Neither script can delete the Pinecone index itself.
+
+### Pinecone index requirements
+
+Before running either script, the configured Pinecone index must already
+exist with:
+
+- **1536 dimensions** (matching the default embedding model,
+  `text-embedding-3-small`);
+- **metric: cosine**.
+
+### Local configuration
+
+Create `.env` from `.env.example` (see the [Configuration](#configuration)
+section below) and fill in real `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`,
+`OPENAI_API_KEY`, and `OPENAI_CHAT_MODEL`. **Never commit `.env`** -- it is
+already excluded via `.gitignore`.
+
+### Calibration: measuring real cosine scores
+
+`scripts/calibrate_similarity.py` embeds four fixed, realistic
+Russian-language phrase pairs (a likely paraphrase, a related-but-distinct
+preference, a potentially conflicting preference, and an unrelated
+statement), measures the real Pinecone cosine score for each, and prints a
+table plus a JSON summary. All calibration data is written to a throwaway
+`calibration-<uuid>` namespace and **deleted in a `finally` block** before
+the script exits, regardless of success or failure.
+
+```bash
+python scripts/calibrate_similarity.py
+```
+
+The script's `suggested_threshold_range` output is **descriptive only** --
+a single observed score never proves semantic equivalence on its own.
+Choosing `MEMORY_SIMILARITY_THRESHOLD` requires human judgment across
+repeated runs and real usage, not one script's numbers; it is not a
+universal constant to copy verbatim into `.env`.
+
+### Smoke test: end-to-end MemoryService validation
+
+`scripts/smoke_test_memory.py` runs `remember` / `recall` / `forget_user`
+through a synthetic Telegram user ID (default `900000001`, a placeholder
+that is never a real Telegram user). It cleans that user's namespace both
+before and after the run, so it never leaves data behind and never touches
+another namespace.
+
+```bash
+python scripts/smoke_test_memory.py
+python scripts/smoke_test_memory.py --require-semantic-skip
+```
+
+Without `--require-semantic-skip`, the script does not fail just because
+the paraphrase step was classified as a new memory instead of a semantic
+duplicate under the current threshold -- that classification is exactly
+what calibration is for. With the flag, the paraphrase step **must** be
+classified as `skipped/semantic_duplicate`, or the script fails.
+
+### Still pending
+
+Telegram integration and chat completion remain unimplemented. These two
+scripts validate the storage and policy layers against real Pinecone/OpenAI
+credentials; they do not exercise any Telegram code path.
 
 ## Requirements
 
