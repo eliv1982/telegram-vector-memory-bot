@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -36,7 +37,10 @@ class MemoryWriteResult(BaseModel):
     reason: MemoryReason
     memory_id: str | None = None
     existing_id: str | None = None
-    similarity_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Cosine similarity ranges from -1 to 1; the duplicate *threshold* configured in
+    # Settings is separately constrained to 0..1, since dedup only ever cares about
+    # positive similarity.
+    similarity_score: float | None = Field(default=None, ge=-1.0, le=1.0)
 
     @model_validator(mode="after")
     def _validate_consistency(self) -> MemoryWriteResult:
@@ -77,4 +81,41 @@ class MemoryRecord(BaseModel):
             raise ValueError("content_hash must not be empty or whitespace-only")
         if self.created_at.tzinfo is None:
             raise ValueError("created_at must be timezone-aware")
+        return self
+
+
+class IndexInfo(BaseModel):
+    """Resolved, validated description of the configured Pinecone index."""
+
+    name: str
+    host: str
+    dimension: int
+    metric: str
+    ready: bool
+    state: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_index_info(self) -> IndexInfo:
+        if not self.name.strip():
+            raise ValueError("name must not be empty")
+        if not self.host.strip():
+            raise ValueError("host must not be empty")
+        if self.dimension <= 0:
+            raise ValueError("dimension must be positive")
+        if not self.metric.strip():
+            raise ValueError("metric must not be empty")
+        return self
+
+
+class VectorMatch(BaseModel):
+    """A single scored match returned from a vector query."""
+
+    vector_id: str
+    score: float = Field(ge=-1.0, le=1.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_vector_match(self) -> VectorMatch:
+        if not self.vector_id.strip():
+            raise ValueError("vector_id must not be empty")
         return self

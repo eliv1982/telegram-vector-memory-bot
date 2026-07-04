@@ -8,10 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from telegram_vector_memory_bot.models import (
+    IndexInfo,
     MemoryAction,
     MemoryReason,
     MemoryRecord,
     MemoryWriteResult,
+    VectorMatch,
 )
 
 
@@ -82,7 +84,19 @@ def test_duplicate_with_inserted_action_rejected() -> None:
         )
 
 
-@pytest.mark.parametrize("score", [-0.01, 1.01])
+@pytest.mark.parametrize("score", [-1.0, 1.0])
+def test_similarity_score_boundary_values_accepted(score: float) -> None:
+    result = MemoryWriteResult(
+        action=MemoryAction.SKIPPED,
+        reason=MemoryReason.SEMANTIC_DUPLICATE,
+        existing_id="mem-1",
+        similarity_score=score,
+    )
+
+    assert result.similarity_score == score
+
+
+@pytest.mark.parametrize("score", [-1.01, 1.01])
 def test_similarity_score_out_of_range_rejected(score: float) -> None:
     with pytest.raises(ValidationError):
         MemoryWriteResult(
@@ -167,3 +181,107 @@ def test_memory_record_optional_telegram_fields_default_to_none() -> None:
     assert record.username is None
     assert record.first_name is None
     assert record.last_name is None
+
+
+def test_valid_index_info() -> None:
+    info = IndexInfo(
+        name="my-index",
+        host="my-index-abc123.svc.pinecone.io",
+        dimension=1536,
+        metric="cosine",
+        ready=True,
+        state="Ready",
+    )
+
+    assert info.dimension == 1536
+    assert info.state == "Ready"
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+def test_index_info_empty_name_rejected(name: str) -> None:
+    with pytest.raises(ValidationError):
+        IndexInfo(
+            name=name,
+            host="my-index-abc123.svc.pinecone.io",
+            dimension=1536,
+            metric="cosine",
+            ready=True,
+        )
+
+
+@pytest.mark.parametrize("host", ["", "   "])
+def test_index_info_empty_host_rejected(host: str) -> None:
+    with pytest.raises(ValidationError):
+        IndexInfo(
+            name="my-index",
+            host=host,
+            dimension=1536,
+            metric="cosine",
+            ready=True,
+        )
+
+
+@pytest.mark.parametrize("dimension", [0, -1])
+def test_index_info_non_positive_dimension_rejected(dimension: int) -> None:
+    with pytest.raises(ValidationError):
+        IndexInfo(
+            name="my-index",
+            host="my-index-abc123.svc.pinecone.io",
+            dimension=dimension,
+            metric="cosine",
+            ready=True,
+        )
+
+
+def test_index_info_empty_metric_rejected() -> None:
+    with pytest.raises(ValidationError):
+        IndexInfo(
+            name="my-index",
+            host="my-index-abc123.svc.pinecone.io",
+            dimension=1536,
+            metric="   ",
+            ready=True,
+        )
+
+
+def test_index_info_state_defaults_to_none() -> None:
+    info = IndexInfo(
+        name="my-index",
+        host="my-index-abc123.svc.pinecone.io",
+        dimension=1536,
+        metric="cosine",
+        ready=True,
+    )
+
+    assert info.state is None
+
+
+def test_valid_vector_match() -> None:
+    match = VectorMatch(vector_id="mem-1", score=0.42, metadata={"user_id": 1})
+
+    assert match.vector_id == "mem-1"
+    assert match.metadata == {"user_id": 1}
+
+
+def test_vector_match_metadata_defaults_to_empty_dict() -> None:
+    match = VectorMatch(vector_id="mem-1", score=0.42)
+
+    assert match.metadata == {}
+
+
+def test_vector_match_empty_id_rejected() -> None:
+    with pytest.raises(ValidationError):
+        VectorMatch(vector_id="   ", score=0.42)
+
+
+@pytest.mark.parametrize("score", [-1.01, 1.01])
+def test_vector_match_score_out_of_range_rejected(score: float) -> None:
+    with pytest.raises(ValidationError):
+        VectorMatch(vector_id="mem-1", score=score)
+
+
+@pytest.mark.parametrize("score", [-1.0, 1.0])
+def test_vector_match_score_boundary_values_accepted(score: float) -> None:
+    match = VectorMatch(vector_id="mem-1", score=score)
+
+    assert match.score == score
