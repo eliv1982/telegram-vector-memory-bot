@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pinecone import ForbiddenError, NotFoundError, RateLimitError, ServiceError, UnauthorizedError
 
 from telegram_vector_memory_bot import pinecone_manager
 from telegram_vector_memory_bot.config import Settings
@@ -739,6 +740,194 @@ def test_query_bool_score_rejected(
         manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
 
 
+# ---------------------------------------------------------------------------
+# Cosine score boundary normalization
+# ---------------------------------------------------------------------------
+
+
+def test_query_score_exactly_one_unchanged(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": 1.0, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == 1.0
+
+
+def test_query_score_exactly_negative_one_unchanged(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": -1.0, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == -1.0
+
+
+def test_query_score_positive_overshoot_within_epsilon_normalized(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": 1.0000001, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == 1.0
+
+
+def test_query_score_negative_overshoot_within_epsilon_normalized(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": -1.0000001, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == -1.0
+
+
+def test_query_score_positive_overshoot_beyond_epsilon_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": 1.00001, "metadata": {}}]
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+
+def test_query_score_negative_overshoot_beyond_epsilon_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": -1.00001, "metadata": {}}]
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+
+def test_query_score_nan_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": float("nan"), "metadata": {}}]
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+
+def test_query_score_positive_infinity_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": float("inf"), "metadata": {}}]
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+
+def test_query_score_negative_infinity_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": float("-inf"), "metadata": {}}]
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+
+def test_query_integer_score_accepted_and_normalized_to_float(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": 1, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == 1.0
+    assert isinstance(matches[0].score, float)
+
+
+def test_query_dict_style_response_uses_normalized_score(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": 1.0000001, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == 1.0
+
+
+def test_query_attribute_style_response_uses_normalized_score(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = SimpleNamespace(
+        matches=[SimpleNamespace(id="mem-1", score=-1.0000001, metadata={})]
+    )
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == -1.0
+
+
+def test_query_match_order_preserved_with_normalized_scores(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [
+            {"id": "mem-overshoot", "score": 1.0000001, "metadata": {}},
+            {"id": "mem-plain", "score": 0.5, "metadata": {}},
+        ]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert [m.vector_id for m in matches] == ["mem-overshoot", "mem-plain"]
+    assert matches[0].score == 1.0
+    assert matches[1].score == 0.5
+
+
+def test_query_non_numeric_score_wrapped_as_vector_query_error(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": "not-a-number", "metadata": {}}]
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+
+def test_query_score_error_message_does_not_expose_injected_secret(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    secret = "sk-FAKE-INJECTED-SECRET-VALUE"
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": 1.00001, "metadata": {"text": secret}}]
+    }
+
+    with pytest.raises(VectorQueryError) as exc_info:
+        manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
+
+
 def test_query_missing_match_id_rejected(
     manager: PineconeManager,
     fake_pinecone: FakePineconeClient,
@@ -942,6 +1131,127 @@ def test_delete_pinecone_exception_wrapped(
         manager.delete_namespace("user-1")
 
     assert exc_info.value.__cause__ is original
+
+
+# ---------------------------------------------------------------------------
+# Idempotent namespace deletion
+# ---------------------------------------------------------------------------
+
+
+def test_delete_official_not_found_error_treated_as_success(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    fake_pinecone._index_handle.raise_on_delete = NotFoundError("namespace not found")
+
+    manager.delete_namespace("user-1")
+
+    assert fake_pinecone._index_handle.delete_calls == [
+        {"delete_all": True, "namespace": "user-1"}
+    ]
+
+
+def test_delete_status_code_404_treated_as_success(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    class FakeApiException(Exception):
+        def __init__(self, status_code: int) -> None:
+            super().__init__("not found")
+            self.status_code = status_code
+
+    fake_pinecone._index_handle.raise_on_delete = FakeApiException(404)
+
+    manager.delete_namespace("user-1")
+
+    assert fake_pinecone._index_handle.delete_calls == [
+        {"delete_all": True, "namespace": "user-1"}
+    ]
+
+
+def test_delete_legacy_status_404_treated_as_success(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    class LegacyApiException(Exception):
+        def __init__(self, status: int) -> None:
+            super().__init__("not found")
+            self.status = status
+
+    fake_pinecone._index_handle.raise_on_delete = LegacyApiException(404)
+
+    manager.delete_namespace("user-1")
+
+    assert fake_pinecone._index_handle.delete_calls == [
+        {"delete_all": True, "namespace": "user-1"}
+    ]
+
+
+def test_delete_401_error_not_swallowed(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    original = UnauthorizedError("invalid api key")
+    fake_pinecone._index_handle.raise_on_delete = original
+
+    with pytest.raises(VectorStorageError) as exc_info:
+        manager.delete_namespace("user-1")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_delete_403_error_not_swallowed(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    original = ForbiddenError("forbidden")
+    fake_pinecone._index_handle.raise_on_delete = original
+
+    with pytest.raises(VectorStorageError) as exc_info:
+        manager.delete_namespace("user-1")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_delete_429_error_not_swallowed(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    original = RateLimitError("rate limited")
+    fake_pinecone._index_handle.raise_on_delete = original
+
+    with pytest.raises(VectorStorageError) as exc_info:
+        manager.delete_namespace("user-1")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_delete_500_error_not_swallowed(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    original = ServiceError("internal error")
+    fake_pinecone._index_handle.raise_on_delete = original
+
+    with pytest.raises(VectorStorageError) as exc_info:
+        manager.delete_namespace("user-1")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_delete_non_404_exception_message_does_not_expose_injected_secret(
+    manager: PineconeManager,
+    fake_pinecone: FakePineconeClient,
+) -> None:
+    secret = "sk-FAKE-INJECTED-SECRET-VALUE"
+    original = ServiceError(f"Authorization: Bearer {secret}")
+    fake_pinecone._index_handle.raise_on_delete = original
+
+    with pytest.raises(VectorStorageError) as exc_info:
+        manager.delete_namespace("user-1")
+
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
 
 
 def test_no_method_can_delete_the_entire_index(

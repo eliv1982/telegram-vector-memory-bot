@@ -10,19 +10,25 @@ is instantiated, never at import time.
 
 from __future__ import annotations
 
+import logging
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 from openai import OpenAI
-from pinecone import Pinecone
+from pinecone import NotFoundError, Pinecone
 from pydantic import ValidationError
 
 from .config import Settings
 from .models import IndexInfo, VectorMatch
 
+logger = logging.getLogger(__name__)
+
 _MIN_TOP_K: Final = 1
 _MAX_TOP_K: Final = 20
 _EXPECTED_METRIC: Final = "cosine"
+_NOT_FOUND_STATUS: Final = 404
+_COSINE_SCORE_EPSILON: Final = 1e-6
 
 _MISSING: Final = object()
 
@@ -78,6 +84,29 @@ def _to_plain_dict(source: Any) -> dict[str, Any]:
     raise TypeError(f"cannot convert {type(source).__name__} to a plain dict")
 
 
+def _is_not_found_error(exc: Exception) -> bool:
+    """Detect a Pinecone not-found response without parsing exception text.
+
+    Prefers the official ``NotFoundError`` type; falls back to a safely
+    inspected ``status_code`` (current SDK) or ``status`` (legacy SDK
+    variants) attribute equal to 404, for compatibility across SDK versions.
+    """
+    if isinstance(exc, NotFoundError):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        if status_code == _NOT_FOUND_STATUS:
+            return True
+
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        if status == _NOT_FOUND_STATUS:
+            return True
+
+    return False
+
+
 def _require_non_empty_str(value: Any, field_name: str, error_cls: type[VectorMemoryError]) -> str:
     if not isinstance(value, str) or not value.strip():
         raise error_cls(f"{field_name} must not be empty")
@@ -123,17 +152,43 @@ def _build_openai_client(settings: Settings) -> OpenAI:
     return OpenAI(**kwargs)
 
 
+def _normalize_cosine_score(score: Any, error_cls: type[VectorMemoryError]) -> float:
+    """Normalize a raw Pinecone query-match score to the canonical [-1, 1] range.
+
+    Pinecone cosine scores are conceptually normalized to [-1, 1], but the SDK
+    returns ordinary floating-point values that can microscopically overshoot
+    that boundary (e.g. ``1.0000001``) due to floating-point arithmetic on the
+    external service. Only that microscopic drift -- within
+    ``_COSINE_SCORE_EPSILON`` of +-1 -- is clamped to the exact boundary;
+    values materially outside [-1, 1], and non-finite values, are still
+    rejected. This tolerance is specific to this external-response boundary
+    and is never applied to user input or configured thresholds.
+    """
+    if isinstance(score, bool) or not isinstance(score, int | float):
+        raise error_cls("query match score must be numeric")
+
+    value = float(score)
+    if not math.isfinite(value):
+        raise error_cls("query match score must be a finite number")
+
+    if -1.0 <= value <= 1.0:
+        return value
+    if 1.0 < value <= 1.0 + _COSINE_SCORE_EPSILON:
+        logger.debug("Normalized cosine score at floating-point boundary")
+        return 1.0
+    if -1.0 - _COSINE_SCORE_EPSILON <= value < -1.0:
+        logger.debug("Normalized cosine score at floating-point boundary")
+        return -1.0
+
+    raise error_cls("query match score is out of the valid [-1, 1] range")
+
+
 def _parse_vector_match(raw_match: Any) -> VectorMatch:
     match_id = _get_field(raw_match, "id")
     if not isinstance(match_id, str) or not match_id.strip():
         raise VectorQueryError("query match is missing a valid id")
 
-    score = _get_field(raw_match, "score")
-    if isinstance(score, bool) or not isinstance(score, int | float):
-        raise VectorQueryError("query match score must be numeric")
-    score = float(score)
-    if not (-1.0 <= score <= 1.0):
-        raise VectorQueryError("query match score is out of the valid [-1, 1] range")
+    score = _normalize_cosine_score(_get_field(raw_match, "score"), VectorQueryError)
 
     metadata = _get_field(raw_match, "metadata")
     if metadata is _MISSING or metadata is None:
@@ -388,12 +443,20 @@ class PineconeManager:
         return result
 
     def delete_namespace(self, namespace: str) -> None:
-        """Delete all vectors in *namespace*. Never deletes the index itself."""
+        """Delete all vectors in *namespace*. Never deletes the index itself.
+
+        Idempotent: a namespace that is already absent is treated as a
+        successfully deleted namespace, since Pinecone reports a not-found
+        response for a namespace with no data rather than a no-op success.
+        """
         namespace = _require_non_empty_str(namespace, "namespace", VectorStorageError)
         try:
             self._index.delete(delete_all=True, namespace=namespace)
         except Exception as exc:
-            raise VectorStorageError("namespace deletion failed") from exc
+            if _is_not_found_error(exc):
+                logger.info("Namespace already absent; deletion treated as successful")
+                return
+            raise VectorStorageError("Namespace deletion failed") from exc
 
     def describe_index_stats(self) -> dict[str, Any]:
         """Return the index-wide stats as a plain, unshared dict."""
