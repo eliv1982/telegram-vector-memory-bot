@@ -93,7 +93,13 @@ models, and `PineconeManager`. Stage 3 adds two new layers on top:
   `RecalledMemory` -- malformed stored metadata raises
   `StoredMemoryFormatError` rather than being silently fabricated.
 - `forget_user`: deletes only that user's namespace. Never touches another
-  user's namespace and never deletes the Pinecone index itself.
+  user's namespace and never deletes the Pinecone index itself. Deletion is
+  idempotent: deleting a namespace with no data (e.g. a user who was already
+  forgotten, or never had any memories) is treated as success, not a
+  failure -- Telegram's `/forget_me` command and the synthetic smoke-test
+  cleanup below both rely on this. Non-not-found infrastructure errors
+  (authentication, authorization, rate-limit, network, or server failures)
+  still fail honestly as `VectorStorageError`.
 
 **Current limitation:** for this educational MVP, every valid, non-empty
 message passed to `remember` is considered eligible for memory -- there is
@@ -114,6 +120,18 @@ no separate classifier deciding whether a message is "worth remembering".
 `describe_index`), not by index name, because Pinecone's data-plane API is
 served per-host; resolving the host once and caching the data client avoids
 a `describe_index` round trip on every read or write.
+
+Cosine similarity is conceptually normalized to [-1, 1], but the Pinecone SDK
+returns ordinary floating-point values, and external floating-point
+arithmetic can produce a microscopic boundary drift on an exact self-match
+(e.g. `1.0000001` instead of `1.0`). `PineconeManager` clamps only scores
+within `1e-6` of +-1 to the exact boundary when parsing a query response;
+materially invalid scores (e.g. `1.01`) and non-finite scores (`NaN`,
++-infinity) still raise `VectorQueryError`. This tolerance applies only to
+this external-response boundary -- it does not alter the semantic duplicate
+threshold, `MemoryPolicy`'s classification logic, or the strict `[-1, 1]`
+contract enforced by `VectorMatch`, `MemoryWriteResult`, and
+`RecalledMemory`.
 
 External clients (Pinecone, OpenAI) are created lazily, only when a
 `PineconeManager` is instantiated -- never at module import time. The
@@ -261,6 +279,13 @@ that is never a real Telegram user). It cleans that user's namespace both
 before and after the run, so it never leaves data behind and never touches
 another namespace.
 
+The initial cleanup relies on `forget_user`/`delete_namespace` being
+idempotent: on a fresh Pinecone project (or after a prior run already
+cleaned up), the synthetic namespace does not exist yet, and that absence is
+treated as a successfully deleted namespace rather than a script failure.
+A genuine infrastructure error during cleanup (bad credentials, rate
+limiting, a Pinecone server error, and so on) still aborts the run.
+
 ```bash
 python scripts/smoke_test_memory.py
 python scripts/smoke_test_memory.py --require-semantic-skip
@@ -275,8 +300,22 @@ classified as `skipped/semantic_duplicate`, or the script fails.
 Every read-after-write and read-after-delete boundary is bounded-polled
 before the script trusts it: the first memory must become fetch-visible
 before the exact-duplicate check, and query-visible before the paraphrase
-step; recall must return at least one result before it is required, and
-recall after `forget_user` must become empty (a single stale, non-empty
+step. Recall acceptance requires more than a merely non-empty result: an
+older, unrelated memory can already be query-visible while the newly
+inserted training memory (`"По будням я обычно тренируюсь вечером."`) is
+not yet visible, so a non-empty result that does not contain that memory's
+exact ID is treated as not-yet-consistent, not as success. The script polls
+until that ID appears in the recall results for the fixed acceptance query
+(`"Когда мне удобнее заниматься спортом?"`) -- accounting for Pinecone's
+delayed query visibility without ever reinserting the memory or repeating
+`remember()` while waiting. Any rank within the configured `MEMORY_TOP_K`
+window is accepted, and the observed one-based rank is reported as
+`expected_recall_rank`: dense vector retrieval alone does not guarantee the
+newly inserted memory is the single closest match, and reranking is outside
+the current homework scope (it could be added later if strict top-1
+relevance becomes a requirement), so a successful run may legitimately
+report rank 2 (or any other rank up to `MEMORY_TOP_K`) rather than rank 1.
+Recall after `forget_user` must separately become empty (a single stale, non-empty
 recall result right after deletion is not treated as a cleanup failure).
 The `finally`-block safety net still always runs; if the main scenario
 already failed and the safety net's own cleanup also times out, the

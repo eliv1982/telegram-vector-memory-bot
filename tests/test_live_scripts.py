@@ -10,12 +10,14 @@ performs a real network request or reads the user's real ``.env`` file.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import runpy
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -24,6 +26,7 @@ from telegram_vector_memory_bot.config import Settings
 from telegram_vector_memory_bot.memory_policy import MemoryPolicy
 from telegram_vector_memory_bot.memory_service import MemoryService
 from telegram_vector_memory_bot.models import IndexInfo, VectorMatch
+from telegram_vector_memory_bot.pinecone_manager import VectorStorageError
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 DIMENSION = 4
@@ -312,6 +315,37 @@ class RecallVisibilityManager(InMemoryFakeManager):
         )
 
 
+class RaisingDeleteManager(InMemoryFakeManager):
+    """Delete-namespace double mirroring PineconeManager's idempotent contract.
+
+    Deleting an already-absent namespace always succeeds silently here, just
+    as the real ``PineconeManager.delete_namespace`` treats a Pinecone
+    not-found response as a successful no-op. A configured failure instead
+    raises ``VectorStorageError`` -- the same exception type the real manager
+    raises for genuine (non-404) infrastructure errors -- so these tests
+    exercise the scripts' and MemoryService's behavior at that seam without
+    re-implementing any Pinecone-specific exception inspection here.
+    """
+
+    def __init__(
+        self,
+        embeddings: dict[str, list[float]],
+        *,
+        fail_on_call_number: int | None = None,
+        failure: Exception | None = None,
+    ) -> None:
+        super().__init__(embeddings)
+        self._fail_on_call_number = fail_on_call_number
+        self._failure = failure or VectorStorageError("Namespace deletion failed")
+        self._delete_namespace_calls = 0
+
+    def delete_namespace(self, namespace: str) -> None:
+        self._delete_namespace_calls += 1
+        if self._delete_namespace_calls == self._fail_on_call_number:
+            raise self._failure
+        super().delete_namespace(namespace)
+
+
 def _stale_match() -> VectorMatch:
     """A syntactically valid but logically stale recall match for delete-consistency tests."""
     return VectorMatch(
@@ -320,6 +354,23 @@ def _stale_match() -> VectorMatch:
         metadata={
             "text": "stale memory from before deletion",
             "content_hash": "stale-hash",
+            "created_at": "2020-01-01T00:00:00+00:00",
+            "source": "telegram",
+            "record_type": "user_memory",
+        },
+    )
+
+
+def _irrelevant_match() -> VectorMatch:
+    """The exact false positive the live smoke test hit: an older, unrelated
+    memory that is already query-visible and non-empty, but is not the newly
+    inserted training memory recall acceptance actually requires."""
+    return VectorMatch(
+        vector_id="irrelevant-older-memory-id",
+        score=0.55,
+        metadata={
+            "text": "Я предпочитаю короткие ответы без лишних подробностей.",
+            "content_hash": "irrelevant-hash",
             "created_at": "2020-01-01T00:00:00+00:00",
             "source": "telegram",
             "record_type": "user_memory",
@@ -718,11 +769,103 @@ def test_smoke_test_cleans_stale_namespace_before_execution() -> None:
         metadata={"text": "stale data from a previous run", "record_type": "user_memory"},
     )
 
-    summary = ns["run_smoke_test"](service, manager, user_id=user_id, require_semantic_skip=False)
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=user_id, require_semantic_skip=False
+    )
 
     # If pre-cleanup hadn't run, this exact deterministic ID would already
     # exist and the first write would be reported as an exact duplicate.
     assert summary["first_write"]["action"] == "inserted"
+
+
+def test_smoke_test_initial_stale_cleanup_succeeds_on_absent_namespace_and_continues() -> None:
+    """A manager reporting an absent namespace on initial cleanup must not
+    fail the smoke test -- it behaves as a successful idempotent no-op, and
+    the scenario continues on to the first write."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    manager = RaisingDeleteManager(_default_smoke_embeddings(ns))
+    service = MemoryService(manager=manager, settings=settings)
+
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=900000030, require_semantic_skip=False
+    )
+
+    assert manager._delete_namespace_calls >= 1
+    assert summary["first_write"]["action"] == "inserted"
+    assert summary["cleanup_verified"] is True
+
+
+def test_smoke_test_non_404_initial_cleanup_failure_aborts_safely() -> None:
+    """A genuine (non-404) infrastructure failure during the initial cleanup
+    must propagate rather than being swallowed, and must abort before any
+    write is attempted."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    manager = RaisingDeleteManager(_default_smoke_embeddings(ns), fail_on_call_number=1)
+    service = MemoryService(manager=manager, settings=settings)
+
+    with pytest.raises(VectorStorageError):
+        ns["run_smoke_test"](
+            service, manager, settings=settings, user_id=900000031, require_semantic_skip=False
+        )
+
+    assert manager.upsert_calls == []
+
+
+def test_smoke_test_main_reports_non_404_cleanup_failure_and_returns_nonzero() -> None:
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    manager = RaisingDeleteManager(_default_smoke_embeddings(ns), fail_on_call_number=1)
+
+    ns["get_settings"] = lambda: settings
+    ns["PineconeManager"] = lambda settings: manager
+
+    exit_code = ns["main"](["--user-id", "900000032"])
+
+    assert exit_code != 0
+    assert manager.upsert_calls == []
+
+
+def test_smoke_test_final_cleanup_remains_idempotent_on_already_absent_namespace() -> None:
+    """The safety-net final cleanup, run after the scenario's own successful
+    cleanup has already emptied the namespace, must also succeed idempotently
+    rather than treating the now-absent namespace as an error."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    manager = RaisingDeleteManager(_default_smoke_embeddings(ns))
+    service = MemoryService(manager=manager, settings=settings)
+
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=900000033, require_semantic_skip=False
+    )
+
+    # forget_user is called at least three times: initial cleanup, the
+    # scenario's own end-of-run cleanup, and the finally-block safety net --
+    # every one of them idempotent against an already-empty namespace.
+    assert manager._delete_namespace_calls >= 3
+    assert summary["cleanup_verified"] is True
+
+
+def test_smoke_test_cleanup_failure_output_never_contains_injected_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ns = _load_script("smoke_test_memory.py")
+    fake_secret = "sk-FAKE-INJECTED-SECRET-VALUE"
+    settings = _build_settings(OPENAI_API_KEY=fake_secret, PINECONE_API_KEY=fake_secret)
+    # Matches PineconeManager.delete_namespace's real contract: a genuine
+    # (non-404) failure always carries a fixed, secret-free message -- never
+    # the underlying exception's body, headers, or credentials.
+    manager = RaisingDeleteManager(_default_smoke_embeddings(ns), fail_on_call_number=1)
+
+    ns["get_settings"] = lambda: settings
+    ns["PineconeManager"] = lambda settings: manager
+
+    with caplog.at_level(logging.INFO):
+        exit_code = ns["main"](["--user-id", "900000034"])
+
+    assert exit_code != 0
+    assert fake_secret not in caplog.text
 
 
 def test_smoke_test_happy_path_end_to_end() -> None:
@@ -731,7 +874,9 @@ def test_smoke_test_happy_path_end_to_end() -> None:
     manager = InMemoryFakeManager(_default_smoke_embeddings(ns))
     service = MemoryService(manager=manager, settings=settings)
 
-    summary = ns["run_smoke_test"](service, manager, user_id=900000005, require_semantic_skip=False)
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=900000005, require_semantic_skip=False
+    )
 
     assert summary["first_write"]["action"] == "inserted"
     assert summary["first_write"]["reason"] == "new_memory"
@@ -750,7 +895,9 @@ def test_smoke_test_semantic_paraphrase_reported_without_mandatory_failure_by_de
     manager = InMemoryFakeManager(_default_smoke_embeddings(ns))
     service = MemoryService(manager=manager, settings=settings)
 
-    summary = ns["run_smoke_test"](service, manager, user_id=900000006, require_semantic_skip=False)
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=900000006, require_semantic_skip=False
+    )
 
     assert summary["semantic_paraphrase"]["action"] == "inserted"
 
@@ -763,7 +910,9 @@ def test_smoke_test_require_semantic_skip_succeeds_when_skipped() -> None:
     manager = InMemoryFakeManager(embeddings)
     service = MemoryService(manager=manager, settings=settings)
 
-    summary = ns["run_smoke_test"](service, manager, user_id=900000007, require_semantic_skip=True)
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=900000007, require_semantic_skip=True
+    )
 
     assert summary["semantic_paraphrase"]["action"] == "skipped"
     assert summary["semantic_paraphrase"]["reason"] == "semantic_duplicate"
@@ -776,7 +925,9 @@ def test_smoke_test_require_semantic_skip_fails_when_not_skipped() -> None:
     service = MemoryService(manager=manager, settings=settings)
 
     with pytest.raises(ns["SmokeTestError"]):
-        ns["run_smoke_test"](service, manager, user_id=900000008, require_semantic_skip=True)
+        ns["run_smoke_test"](
+            service, manager, settings=settings, user_id=900000008, require_semantic_skip=True
+        )
 
 
 def test_smoke_test_final_cleanup_always_runs_after_failure() -> None:
@@ -792,7 +943,9 @@ def test_smoke_test_final_cleanup_always_runs_after_failure() -> None:
     namespace = service.namespace_for_user(user_id)
 
     with pytest.raises(ns["SmokeTestError"]):
-        ns["run_smoke_test"](service, manager, user_id=user_id, require_semantic_skip=False)
+        ns["run_smoke_test"](
+            service, manager, settings=settings, user_id=user_id, require_semantic_skip=False
+        )
 
     assert manager.delete_calls.count(namespace) >= 2
 
@@ -806,7 +959,9 @@ def test_smoke_test_never_calls_delete_index() -> None:
     # InMemoryFakeManager raises AssertionError if delete_index is ever
     # accessed; reaching this point without error proves the smoke test only
     # ever deletes the synthetic user's namespace, never the index.
-    summary = ns["run_smoke_test"](service, manager, user_id=900000009, require_semantic_skip=False)
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=900000009, require_semantic_skip=False
+    )
 
     assert summary["cleanup_verified"] is True
 
@@ -856,6 +1011,236 @@ def test_smoke_test_main_output_never_contains_injected_fake_secret(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert fake_secret not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Cosine score boundary regression: real PineconeManager behind the smoke test
+# ---------------------------------------------------------------------------
+#
+# These tests wire the *real* PineconeManager (not InMemoryFakeManager) behind
+# MemoryService and the smoke script, backed only by a fake raw Pinecone index
+# handle and a fake OpenAI client. This exercises PineconeManager's actual
+# query-response parsing -- including its cosine-score boundary normalization
+# -- rather than reimplementing that logic in a test double.
+
+
+def _score_boundary_index_description() -> dict[str, Any]:
+    return {
+        "name": "test-index",
+        "host": "test-index.svc.pinecone.io",
+        "dimension": DIMENSION,
+        "metric": "cosine",
+        "status": {"ready": True, "state": "Ready"},
+    }
+
+
+class ScoreInjectingPineconeClient:
+    """Fake control-plane client wrapping a single fake raw index handle."""
+
+    def __init__(self, index_handle: ScoreInjectingIndexHandle) -> None:
+        self._index_handle = index_handle
+
+    def describe_index(self, name: str) -> dict[str, Any]:
+        return _score_boundary_index_description()
+
+    def Index(self, *, host: str = "", name: str = "") -> ScoreInjectingIndexHandle:
+        return self._index_handle
+
+
+class ScoreInjectingIndexHandle:
+    """Fake raw Pinecone index: real in-memory storage and real cosine
+    similarity, but lets a test override the *raw* score Pinecone would
+    return for the top match on the next non-empty query -- e.g. a
+    floating-point overshoot like ``1.000000119``, or a materially invalid
+    score like ``1.01`` -- to reproduce exactly what a live external
+    response boundary looks like. PineconeManager's own response parser
+    (unmodified, real) is what turns that raw score into a ``VectorMatch``
+    or a ``VectorQueryError``.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, dict[str, dict[str, Any]]] = {}
+        self.score_overrides: list[float] = []
+
+    def upsert(self, *, vectors: list[dict[str, Any]], namespace: str) -> dict[str, Any]:
+        bucket = self._store.setdefault(namespace, {})
+        for vector in vectors:
+            bucket[vector["id"]] = {
+                "values": list(vector["values"]),
+                "metadata": dict(vector["metadata"]),
+            }
+        return {"upserted_count": len(vectors)}
+
+    def query(
+        self,
+        *,
+        vector: list[float],
+        namespace: str,
+        top_k: int,
+        include_metadata: bool = True,
+        filter: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        bucket = self._store.get(namespace, {})
+        candidates = []
+        for vector_id, entry in bucket.items():
+            if not _matches_filter(entry["metadata"], filter):
+                continue
+            candidates.append(
+                {
+                    "id": vector_id,
+                    "score": _cosine(vector, entry["values"]),
+                    "metadata": entry["metadata"],
+                }
+            )
+        candidates.sort(key=lambda m: m["score"], reverse=True)
+        top = candidates[:top_k]
+        # Only ever substitute a genuine self-match (natural cosine already
+        # ~1.0) -- mirroring reality, where the external service's tiny
+        # floating-point drift only ever shows up right at that boundary,
+        # never on an arbitrary, mathematically-distant similarity score.
+        if top and self.score_overrides and top[0]["score"] >= 1.0 - 1e-9:
+            top[0] = {**top[0], "score": self.score_overrides.pop(0)}
+        return {"matches": top}
+
+    def fetch(self, *, ids: list[str], namespace: str) -> dict[str, Any]:
+        bucket = self._store.get(namespace, {})
+        return {"vectors": {vid: bucket[vid] for vid in ids if vid in bucket}}
+
+    def delete(self, *, delete_all: bool, namespace: str) -> None:
+        self._store.pop(namespace, None)
+
+
+class ScoreInjectingOpenAIClient:
+    """Fake OpenAI client returning deterministic, pre-configured embeddings."""
+
+    def __init__(self, embeddings: dict[str, list[float]]) -> None:
+        self._embeddings = embeddings
+        self.embeddings = SimpleNamespace(create=self._create)
+
+    def _create(self, *, input: str, model: str) -> dict[str, Any]:
+        if input not in self._embeddings:
+            raise AssertionError(f"no fake embedding configured for text: {input!r}")
+        return {"data": [{"embedding": list(self._embeddings[input])}]}
+
+
+def _build_real_manager_with_fake_index(
+    embeddings: dict[str, list[float]], settings: Settings
+) -> tuple[Any, ScoreInjectingIndexHandle]:
+    from telegram_vector_memory_bot.pinecone_manager import PineconeManager
+
+    index_handle = ScoreInjectingIndexHandle()
+    pinecone_client = ScoreInjectingPineconeClient(index_handle)
+    openai_client = ScoreInjectingOpenAIClient(embeddings)
+    manager = PineconeManager(
+        settings, pinecone_client=pinecone_client, openai_client=openai_client
+    )
+    return manager, index_handle
+
+
+def test_smoke_test_query_visibility_self_match_overshoot_is_canonicalized() -> None:
+    """A self-match query score of 1.000000119 -- exactly the kind of
+    microscopic floating-point overshoot the live smoke test hit -- must be
+    canonicalized to 1.0 by the real PineconeManager, and the query-visibility
+    check must see it as a normal, valid match rather than raising."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    assert settings.MEMORY_SIMILARITY_THRESHOLD == pytest.approx(0.50)
+
+    manager, index_handle = _build_real_manager_with_fake_index(
+        _default_smoke_embeddings(ns), settings
+    )
+    service = MemoryService(manager=manager, settings=settings)
+
+    user_id = 900000040
+    namespace = service.namespace_for_user(user_id)
+    service.forget_user(user_id=user_id)  # idempotent delete on an absent namespace
+
+    first_write = service.remember(user_id=user_id, text=ns["SHORT_ANSWERS_TEXT"])
+    assert first_write.action.value == "inserted"
+    first_memory_id = first_write.memory_id
+
+    # Force the *next* non-empty query's top match -- the self-match visibility
+    # check below -- to return the exact overshoot value observed live.
+    index_handle.score_overrides = [1.000000119]
+
+    first_memory_query_embedding = manager.create_embedding(ns["SHORT_ANSWERS_TEXT"])
+    matches = manager.query_by_vector(
+        values=first_memory_query_embedding,
+        namespace=namespace,
+        top_k=1,
+        metadata_filter={"record_type": {"$eq": "user_memory"}},
+    )
+
+    assert matches[0].vector_id == first_memory_id
+    assert matches[0].score == 1.0
+
+    # Cleanup polling still works against the real manager afterwards.
+    service.forget_user(user_id=user_id)
+    assert service.recall(user_id=user_id, query=ns["RECALL_QUERY_TEXT"]) == []
+
+
+def test_smoke_test_materially_invalid_score_still_aborts_safely() -> None:
+    """A materially invalid raw score (1.01, far beyond the epsilon tolerance)
+    must still raise -- the fix must not have widened the tolerance -- and
+    that failure must propagate rather than being silently treated as a
+    passing visibility check."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+
+    manager, index_handle = _build_real_manager_with_fake_index(
+        _default_smoke_embeddings(ns), settings
+    )
+    service = MemoryService(manager=manager, settings=settings)
+
+    user_id = 900000041
+    namespace = service.namespace_for_user(user_id)
+    service.forget_user(user_id=user_id)
+
+    first_write = service.remember(user_id=user_id, text=ns["SHORT_ANSWERS_TEXT"])
+    assert first_write.action.value == "inserted"
+
+    index_handle.score_overrides = [1.01]
+
+    embedding = manager.create_embedding(ns["SHORT_ANSWERS_TEXT"])
+
+    with pytest.raises(ns["VectorMemoryError"]):
+        manager.query_by_vector(
+            values=embedding,
+            namespace=namespace,
+            top_k=1,
+            metadata_filter={"record_type": {"$eq": "user_memory"}},
+        )
+
+    service.forget_user(user_id=user_id)
+
+
+def test_smoke_test_run_smoke_test_end_to_end_survives_self_match_overshoot() -> None:
+    """The full smoke-test scenario, run through the real PineconeManager,
+    must complete successfully even when the query-visibility self-match
+    carries a microscopic floating-point overshoot -- reproducing the
+    original live failure end-to-end rather than only at the unit level."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+
+    manager, index_handle = _build_real_manager_with_fake_index(
+        _default_smoke_embeddings(ns), settings
+    )
+    service = MemoryService(manager=manager, settings=settings)
+
+    # Every non-empty query encountered during the run gets the overshoot
+    # applied to its top match; the scenario touches several such queries
+    # (duplicate lookups, the explicit visibility check, and recall), and
+    # every one of them must still resolve correctly.
+    index_handle.score_overrides = [1.000000119] * 10
+
+    summary = ns["run_smoke_test"](
+        service, manager, settings=settings, user_id=900000042, require_semantic_skip=False
+    )
+
+    assert summary["first_write"]["action"] == "inserted"
+    assert summary["different_memory"]["action"] == "inserted"
+    assert summary["recall_count"] >= 1
+    assert summary["cleanup_verified"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1056,6 +1441,7 @@ def test_smoke_fetch_visibility_retries_then_succeeds_without_repeating_work(
     summary = ns["run_smoke_test"](
         service,
         manager,
+        settings=settings,
         user_id=900000020,
         require_semantic_skip=False,
         consistency_timeout=5.0,
@@ -1090,6 +1476,7 @@ def test_smoke_query_visibility_confirmed_before_paraphrase_processing(
     summary = ns["run_smoke_test"](
         service,
         manager,
+        settings=settings,
         user_id=900000021,
         require_semantic_skip=False,
         consistency_timeout=5.0,
@@ -1114,6 +1501,7 @@ def test_smoke_recall_retries_until_populated(monkeypatch: pytest.MonkeyPatch) -
     summary = ns["run_smoke_test"](
         service,
         manager,
+        settings=settings,
         user_id=900000022,
         require_semantic_skip=False,
         consistency_timeout=5.0,
@@ -1128,6 +1516,245 @@ def test_smoke_recall_retries_until_populated(monkeypatch: pytest.MonkeyPatch) -
         ns["DIFFERENT_MEMORY_TEXT"]
     )
     assert sum(1 for c in manager.upsert_calls if c["vector_id"] == different_memory_id) == 1
+
+
+def test_smoke_recall_ignores_irrelevant_nonempty_result_until_expected_id_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the live false positive directly: an older, unrelated memory
+    is already query-visible and returned non-empty, but recall-populated
+    polling must not accept that as consistency -- it must keep polling until
+    the newly inserted training memory's exact ID appears, then succeed once
+    the real store supplies it, ranked first."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    manager = RecallVisibilityManager(
+        _default_smoke_embeddings(ns),
+        forced_responses=2,
+        forced_result=lambda: [_irrelevant_match()],
+    )
+    service = MemoryService(manager=manager, settings=settings)
+    sleep_calls = _patch_time(monkeypatch, step=0.01)
+
+    summary = ns["run_smoke_test"](
+        service,
+        manager,
+        settings=settings,
+        user_id=900000026,
+        require_semantic_skip=False,
+        consistency_timeout=5.0,
+        poll_interval=0.5,
+    )
+
+    expected_memory_id = MemoryPolicy(settings.MEMORY_SIMILARITY_THRESHOLD).memory_id_for_text(
+        ns["DIFFERENT_MEMORY_TEXT"]
+    )
+    # Two forced, non-empty-but-irrelevant responses must not have ended
+    # polling early -- exactly two sleeps occur before the real store (on the
+    # third call) supplies the expected memory.
+    assert len(sleep_calls) == 2
+    assert summary["expected_recall_memory_id"] == expected_memory_id
+    assert summary["expected_recall_present"] is True
+    assert summary["expected_recall_rank"] == 1
+    assert summary["expected_recall_within_top_k"] is True
+    assert summary["recall_count"] >= 1
+    assert summary["cleanup_verified"] is True
+    # remember()/upsert for the expected memory happens exactly once -- never
+    # repeated while polling recall.
+    assert sum(1 for c in manager.upsert_calls if c["vector_id"] == expected_memory_id) == 1
+
+
+def test_smoke_recall_expected_memory_present_at_rank_two_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful top-k retrieval for the current (non-reranked) architecture:
+    the expected memory is present but ranked second behind an older memory.
+    Dense vector retrieval alone does not guarantee rank-1 relevance, so this
+    must be accepted -- not treated as a failure -- as long as it is within
+    the configured top_k. Pinecone's returned order must be preserved as the
+    reported rank."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    manager = RecallVisibilityManager(_default_smoke_embeddings(ns), forced_responses=1)
+    service = MemoryService(manager=manager, settings=settings)
+    user_id = 900000027
+    namespace = service.namespace_for_user(user_id)
+    policy = MemoryPolicy(settings.MEMORY_SIMILARITY_THRESHOLD)
+    first_memory_id = policy.memory_id_for_text(ns["SHORT_ANSWERS_TEXT"])
+    expected_memory_id = policy.memory_id_for_text(ns["DIFFERENT_MEMORY_TEXT"])
+
+    def _rank_two_result() -> list[VectorMatch]:
+        bucket = manager._store[namespace]
+        return [
+            VectorMatch(
+                vector_id=first_memory_id,
+                score=0.99,
+                metadata=dict(bucket[first_memory_id]["metadata"]),
+            ),
+            VectorMatch(
+                vector_id=expected_memory_id,
+                score=0.98,
+                metadata=dict(bucket[expected_memory_id]["metadata"]),
+            ),
+        ]
+
+    manager._forced_result = _rank_two_result
+    sleep_calls = _patch_time(monkeypatch, step=0.01)
+
+    summary = ns["run_smoke_test"](
+        service,
+        manager,
+        settings=settings,
+        user_id=user_id,
+        require_semantic_skip=False,
+        consistency_timeout=5.0,
+        poll_interval=0.5,
+    )
+
+    # Accepted on the very first check -- a rank-2 presence is not "not yet
+    # consistent" and must not be retried.
+    assert sleep_calls == []
+    assert summary["expected_recall_memory_id"] == expected_memory_id
+    assert summary["expected_recall_present"] is True
+    assert summary["expected_recall_rank"] == 2
+    assert summary["expected_recall_within_top_k"] is True
+    assert summary["cleanup_verified"] is True
+    # Pinecone's returned order is preserved verbatim in the reported results.
+    assert [r["memory_id"] for r in summary["recall_results"]] == [
+        first_memory_id,
+        expected_memory_id,
+    ]
+    assert sum(1 for c in manager.upsert_calls if c["vector_id"] == expected_memory_id) == 1
+
+
+def test_smoke_recall_expected_memory_at_last_allowed_top_k_position_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The expected memory ranked exactly at the last allowed top_k position
+    (rank == MEMORY_TOP_K) must still be accepted -- the boundary of the
+    configured window, not just ranks 1 or 2."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    top_k = settings.MEMORY_TOP_K
+    manager = RecallVisibilityManager(_default_smoke_embeddings(ns), forced_responses=1)
+    service = MemoryService(manager=manager, settings=settings)
+    user_id = 900000043
+    namespace = service.namespace_for_user(user_id)
+    policy = MemoryPolicy(settings.MEMORY_SIMILARITY_THRESHOLD)
+    expected_memory_id = policy.memory_id_for_text(ns["DIFFERENT_MEMORY_TEXT"])
+
+    def _rank_last_result() -> list[VectorMatch]:
+        bucket = manager._store[namespace]
+        fillers = [
+            VectorMatch(
+                vector_id=f"filler-memory-{i}",
+                score=0.9 - i * 0.01,
+                metadata={
+                    "text": f"filler memory number {i}",
+                    "content_hash": f"filler-hash-{i}",
+                    "created_at": "2020-01-01T00:00:00+00:00",
+                    "source": "telegram",
+                    "record_type": "user_memory",
+                },
+            )
+            for i in range(1, top_k)
+        ]
+        expected = VectorMatch(
+            vector_id=expected_memory_id,
+            score=0.5,
+            metadata=dict(bucket[expected_memory_id]["metadata"]),
+        )
+        return [*fillers, expected]
+
+    manager._forced_result = _rank_last_result
+    sleep_calls = _patch_time(monkeypatch, step=0.01)
+
+    summary = ns["run_smoke_test"](
+        service,
+        manager,
+        settings=settings,
+        user_id=user_id,
+        require_semantic_skip=False,
+        consistency_timeout=5.0,
+        poll_interval=0.5,
+    )
+
+    assert sleep_calls == []
+    assert summary["expected_recall_rank"] == top_k
+    assert summary["expected_recall_within_top_k"] is True
+    assert summary["recall_count"] == top_k
+    assert summary["cleanup_verified"] is True
+    # Order preserved: the expected memory's reported position is last.
+    assert summary["recall_results"][-1]["memory_id"] == expected_memory_id
+
+
+def test_smoke_recall_expected_memory_never_appears_times_out_safely(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If the expected memory's exact ID never appears in recall results
+    before the consistency timeout, the script must raise a dedicated
+    visibility timeout error rather than accepting an irrelevant non-empty
+    result or hanging indefinitely -- and the finally-block safety-net
+    cleanup must still run despite the failure."""
+    ns = _load_script("smoke_test_memory.py")
+    settings = _build_settings()
+    manager = RecallVisibilityManager(
+        _default_smoke_embeddings(ns),
+        forced_responses=10_000,
+        forced_result=lambda: [_irrelevant_match()],
+    )
+    service = MemoryService(manager=manager, settings=settings)
+    _patch_time(monkeypatch, step=1.0)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ns["SmokeTestVisibilityTimeoutError"]) as exc_info:
+            ns["run_smoke_test"](
+                service,
+                manager,
+                settings=settings,
+                user_id=900000028,
+                require_semantic_skip=False,
+                consistency_timeout=3.0,
+                poll_interval=1.0,
+            )
+
+    assert "newly inserted training memory" in str(exc_info.value)
+    # The safety net's own cleanup attempt still ran (and, since this fake
+    # manager keeps returning a non-empty irrelevant match forever, it too
+    # times out and is logged -- but that never replaces the original error).
+    assert "Safety-net cleanup (forget_user) failed" in caplog.text
+
+
+def test_smoke_test_expected_recall_output_never_contains_full_metadata_or_secrets(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The structured summary must expose only the expected-recall scalars
+    (id/present/rank/score) and short labels -- never full stored metadata,
+    embeddings, client representations, or configured secrets."""
+    ns = _load_script("smoke_test_memory.py")
+    fake_secret = "sk-FAKE-INJECTED-SECRET-VALUE"
+    settings = _build_settings(OPENAI_API_KEY=fake_secret, PINECONE_API_KEY=fake_secret)
+    manager = InMemoryFakeManager(_default_smoke_embeddings(ns))
+
+    ns["get_settings"] = lambda: settings
+    ns["PineconeManager"] = lambda settings: manager
+
+    exit_code = ns["main"](["--user-id", "900000029"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert fake_secret not in captured.out
+    assert "content_hash" not in captured.out
+    assert "embedding" not in captured.out.lower()
+    assert "VectorMatch" not in captured.out
+
+    summary = json.loads(captured.out)
+    assert summary["expected_recall_present"] is True
+    assert summary["expected_recall_rank"] == 1
+    assert summary["expected_recall_within_top_k"] is True
+    assert isinstance(summary["expected_recall_memory_id"], str)
+    assert summary["expected_recall_memory_id"]
+    assert isinstance(summary["expected_recall_score"], float)
 
 
 def test_smoke_deletion_recall_retries_until_empty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1145,6 +1772,7 @@ def test_smoke_deletion_recall_retries_until_empty(monkeypatch: pytest.MonkeyPat
     summary = ns["run_smoke_test"](
         service,
         manager,
+        settings=settings,
         user_id=900000023,
         require_semantic_skip=False,
         consistency_timeout=5.0,
@@ -1176,6 +1804,7 @@ def test_smoke_deletion_visibility_timeout_fails_safely_without_masking_original
             ns["run_smoke_test"](
                 service,
                 manager,
+                settings=settings,
                 user_id=900000024,
                 require_semantic_skip=False,
                 consistency_timeout=3.0,

@@ -34,7 +34,7 @@ import time
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from telegram_vector_memory_bot.config import get_settings
+from telegram_vector_memory_bot.config import Settings, get_settings
 from telegram_vector_memory_bot.memory_service import MemoryService, MemoryServiceError
 from telegram_vector_memory_bot.models import (
     MemoryAction,
@@ -203,6 +203,7 @@ def run_smoke_test(
     service: MemoryService,
     manager: PineconeManager,
     *,
+    settings: Settings,
     user_id: int,
     require_semantic_skip: bool,
     consistency_timeout: float = DEFAULT_CONSISTENCY_TIMEOUT,
@@ -301,21 +302,61 @@ def run_smoke_test(
         )
         summary["different_memory"] = _result_summary(different_memory)
 
-        def _check_recall_populated() -> list[RecalledMemory] | None:
+        expected_memory_id = different_memory.memory_id
+        _require(
+            bool(expected_memory_id),
+            "expected the newly inserted training memory to have a non-empty memory_id",
+        )
+
+        # A merely non-empty recall result is not acceptance: an older,
+        # unrelated memory can already be query-visible while this newly
+        # inserted memory is not yet visible. Poll until the expected memory
+        # ID itself is present -- never re-inserting it or repeating
+        # remember() while waiting.
+        #
+        # Dense vector retrieval alone does not guarantee the newly inserted
+        # memory ranks first among up to MEMORY_TOP_K results -- reranking is
+        # outside the current scope -- so any rank within the configured
+        # top_k is accepted; the observed rank is only recorded, not enforced
+        # to be 1.
+        effective_top_k = settings.MEMORY_TOP_K
+
+        def _check_recall_contains_expected() -> list[RecalledMemory] | None:
             results = service.recall(user_id=user_id, query=RECALL_QUERY_TEXT)
-            return results if len(results) >= 1 else None
+            if any(m.memory_id == expected_memory_id for m in results):
+                return results
+            return None
 
         recalled = _poll_until(
-            _check_recall_populated,
+            _check_recall_contains_expected,
             consistency_timeout=consistency_timeout,
             poll_interval=poll_interval,
-            description="recall to return at least one result",
+            description="recall to include the newly inserted training memory",
         )
+
+        # Pinecone's returned order is preserved as-is (no re-sorting here).
+        expected_index = next(
+            i for i, m in enumerate(recalled) if m.memory_id == expected_memory_id
+        )
+        expected_rank = expected_index + 1
+        _require(
+            1 <= expected_rank <= effective_top_k,
+            "expected the newly inserted training memory "
+            f"({expected_memory_id}) to rank within the configured top_k "
+            f"({effective_top_k}) of recall results for the fixed acceptance "
+            f"query, but it ranked {expected_rank}",
+        )
+
         summary["recall_count"] = len(recalled)
         summary["recall_results"] = [
             {"memory_id": m.memory_id, "score": m.score, "label": _short_label(m.text)}
             for m in recalled
         ]
+        summary["expected_recall_memory_id"] = expected_memory_id
+        summary["expected_recall_present"] = True
+        summary["expected_recall_rank"] = expected_rank
+        summary["expected_recall_score"] = recalled[expected_index].score
+        summary["expected_recall_within_top_k"] = True
 
         service.forget_user(user_id=user_id)
         _poll_until(
@@ -363,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = run_smoke_test(
             service,
             manager,
+            settings=settings,
             user_id=args.user_id,
             require_semantic_skip=args.require_semantic_skip,
             consistency_timeout=args.consistency_timeout,
