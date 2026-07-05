@@ -59,6 +59,18 @@ class Settings(BaseSettings):
     def _validate_non_blank(cls, value: str, info: ValidationInfo) -> str:
         return _require_non_blank(value, info.field_name or "value")
 
+    @field_validator("PINECONE_API_KEY", "OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN")
+    @classmethod
+    def _validate_secret_non_blank(cls, value: SecretStr, info: ValidationInfo) -> SecretStr:
+        """Reject whitespace-only secrets without ever exposing the value.
+
+        Uses ``get_secret_value()`` only to check blankness; the raw value is
+        never interpolated into the raised error message.
+        """
+        if not value.get_secret_value().strip():
+            raise ValueError(f"{info.field_name or 'value'} must not be empty or whitespace-only")
+        return value
+
     @field_validator("OPENAI_BASE_URL", mode="before")
     @classmethod
     def _normalize_optional_base_url(cls, value: Any) -> Any:

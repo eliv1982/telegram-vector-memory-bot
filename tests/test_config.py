@@ -98,6 +98,60 @@ def test_empty_index_name_rejected(monkeypatch: pytest.MonkeyPatch, index_name: 
         Settings(_env_file=None)
 
 
+@pytest.mark.parametrize("token", ["", "   "])
+def test_blank_telegram_bot_token_rejected(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
+    _set_required_env(monkeypatch, TELEGRAM_BOT_TOKEN=token)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("key", ["", "   "])
+def test_blank_pinecone_api_key_rejected(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    _set_required_env(monkeypatch, PINECONE_API_KEY=key)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("key", ["", "   "])
+def test_blank_openai_api_key_rejected(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    _set_required_env(monkeypatch, OPENAI_API_KEY=key)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    "field", ["TELEGRAM_BOT_TOKEN", "PINECONE_API_KEY", "OPENAI_API_KEY"]
+)
+def test_blank_secret_validation_error_does_not_expose_value(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    _set_required_env(monkeypatch, **{field: "   "})
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None)
+
+    rendered = str(exc_info.value)
+    assert "must not be empty or whitespace-only" in rendered
+    # The blank value itself carries no secret content, but confirm no
+    # sibling secret from REQUIRED_ENV leaks into this error's rendering.
+    for key, value in REQUIRED_ENV.items():
+        if key != field:
+            assert value not in rendered
+
+
+def test_valid_secrets_are_still_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.TELEGRAM_BOT_TOKEN.get_secret_value() == "test-telegram-token"
+    assert settings.PINECONE_API_KEY.get_secret_value() == "test-pinecone-key"
+    assert settings.OPENAI_API_KEY.get_secret_value() == "test-openai-key"
+
+
 def test_openai_base_url_absent_becomes_none(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_required_env(monkeypatch)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
