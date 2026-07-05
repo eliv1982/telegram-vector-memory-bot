@@ -1,373 +1,473 @@
-# Telegram Vector Memory Bot
+# Telegram-бот с векторной памятью
 
-## Purpose
+## Назначение проекта
 
-A learning project implementing a Telegram bot with long-term vector memory.
-The bot is intended to remember facts shared by users across conversations,
-using semantic search over embeddings stored in Pinecone, with deduplication
-so that repeated or paraphrased facts do not create redundant memories.
+Telegram-бот с долговременной семантической памятью. Каждый Telegram-пользователь
+получает отдельный namespace (изолированное пространство записей) в Pinecone —
+векторной базе данных, в которой хранятся embeddings (числовые векторные
+представления текста).
 
-## Planned MVP
+Обычный поток обработки сообщения устроен так:
 
-- Receive messages from users via Telegram.
-- Extract memory-worthy statements from user messages.
-- Embed statements with an OpenAI embedding model.
-- Deduplicate against existing memories (exact and semantic duplicates).
-- Store new memories in Pinecone, isolated per user via namespaces.
-- Retrieve relevant memories to give the bot context when answering.
+1. текст пользователя преобразуется в embedding и по нему выполняется retrieval
+   (поиск релевантных воспоминаний) в namespace этого пользователя;
+2. найденные воспоминания передаются в OpenAI-compatible chat model как
+   дополнительный контекст;
+3. модель генерирует ответ, и он отправляется пользователю в Telegram;
+4. только после успешной отправки ответа исходное сообщение пользователя
+   рассматривается для сохранения в памяти (с учетом дедупликации).
 
-## Architecture
+## Возможности
 
-- `src/telegram_vector_memory_bot/config.py` -- typed application settings,
-  loaded from environment variables / `.env` via `pydantic-settings`.
-- `src/telegram_vector_memory_bot/models.py` -- strict domain models and
-  enums describing memory records, index metadata, vector matches, and the
-  outcome of memory write attempts.
-- `src/telegram_vector_memory_bot/pinecone_manager.py` -- `PineconeManager`,
-  a typed infrastructure adapter over the Pinecone and OpenAI SDKs. It
-  validates the configured index, generates embeddings, and performs
-  namespace-scoped vector CRUD operations (upsert, query, fetch, delete,
-  stats).
-- `src/telegram_vector_memory_bot/memory_policy.py` -- `MemoryPolicy`, a
-  pure, dependency-free set of deduplication rules: text normalization,
-  deterministic hashing/IDs, namespace construction, a lightweight RU/EN
-  negation guard, and the semantic-duplicate decision. No Pinecone, no
-  OpenAI, no `Settings`, no I/O.
-- `src/telegram_vector_memory_bot/memory_service.py` -- `MemoryService`,
-  the application layer. It orchestrates `MemoryPolicy` and
-  `PineconeManager` to implement `remember`, `recall`, and `forget_user`.
-- Future stages will add: the Telegram bot entry point and live
-  end-to-end validation.
+- aiogram 3 в качестве Telegram-framework;
+- Pinecone в качестве векторного хранилища;
+- OpenAI embeddings для преобразования текста в векторы;
+- OpenAI-compatible Chat Completions API для генерации ответов;
+- необязательный `OPENAI_BASE_URL` — можно указать совместимый endpoint вместо
+  стандартного OpenAI;
+- отдельный Pinecone namespace для каждого Telegram-пользователя;
+- exact duplicate detection (обнаружение точных дубликатов текста);
+- semantic duplicate detection (обнаружение смысловых дубликатов через
+  сравнение embeddings);
+- retrieval памяти пользователя перед генерацией ответа;
+- сохранение исходного сообщения только после успешной отправки ответа;
+- команды `/start`, `/help`, `/memory`, `/forget_me`;
+- безопасная обработка неизвестных, но синтаксически корректных команд;
+- молчаливое игнорирование некорректного slash-текста;
+- фиксированный ответ на нетекстовые сообщения (фото, стикеры, документы,
+  голосовые и т.д.);
+- разбиение длинных ответов Telegram с учетом лимита в UTF-16 code units;
+- offline unit-тесты (без реальных сетевых вызовов);
+- live smoke-test памяти с реальными Pinecone и OpenAI вызовами;
+- безопасное структурированное логирование без утечки текстов сообщений.
 
-## Project status
+## Архитектура
 
-**Stage 4A: live calibration and smoke-test tooling, on top of Stage 3's
-memory policy and application-level memory service.**
+**PineconeManager** (`pinecone_manager.py`) — инфраструктурный слой:
 
-Stages 1-2 established the project skeleton, typed configuration, domain
-models, and `PineconeManager`. Stage 3 adds two new layers on top:
+- создание embeddings через OpenAI;
+- подключение к Pinecone и проверка сконфигурированного index;
+- query (поиск ближайших векторов);
+- upsert (вставка/обновление вектора);
+- fetch (получение векторов по ID);
+- удаление namespace целиком;
+- чтение index stats (агрегированной статистики index);
+- получение количества записей в конкретном namespace;
+- строгая валидация и безопасный разбор ответов внешнего API, включая
+  нормализацию cosine score (см. раздел «Обработка cosine score»).
 
-### MemoryPolicy (pure, deterministic)
+**MemoryPolicy** (`memory_policy.py`) — чистая (без I/O) логика решений:
 
-- `normalize_text`: NFKC-normalizes, strips, collapses internal whitespace,
-  and casefolds -- used only for hashing/comparison, never overwrites the
-  original text stored as a memory.
-- `content_hash` / `memory_id_for_text`: an unsalted SHA-256 hash of the
-  normalized text, and a deterministic `mem-<hash>` ID derived from it.
-  Deliberately excludes the user ID -- users are already isolated by
-  namespace, so identical text from two different users hashes the same
-  but lives in two different namespaces.
-- `namespace_for_user`: builds `<prefix>-<user_id>` and nothing else --
-  never derived from username, first name, last name, or message text.
-- `has_explicit_negation`: a small, documented RU/EN negation guard
-  (`не`, `нет`, `никогда`, `больше не`, `not`, `no`, `never`, `don't`,
-  `do not`) matched at word boundaries. **This is not a full contradiction
-  detector** -- it will miss implicit negation like "I changed my mind",
-  and only exists to stop a clear negation from being merged into an
-  earlier, non-negated memory.
-- `is_semantic_duplicate`: a candidate is only treated as a duplicate when
-  its score is at or above the configured threshold **and** the new text
-  and the existing text agree on whether they contain an explicit
-  negation. For example, given the threshold is met:
-  - "Пиши мне кратко и по существу." and "Я предпочитаю короткие ответы."
-    -- may be treated as the same memory (no negation on either side).
-  - "Я предпочитаю короткие ответы." and "Я больше не хочу коротких
-    ответов." -- are **never** treated as the same memory, even at a very
-    high similarity score, because exactly one side is negated.
+- нормализация текста для сравнения;
+- content hash (детерминированный хеш нормализованного текста);
+- решение о том, является ли текст точным дубликатом (exact duplicate);
+- решение о том, является ли текст смысловым дубликатом (semantic duplicate);
+- определение того, что текст — это новая память.
 
-### MemoryService (application layer, built on PineconeManager)
+**MemoryService** (`memory_service.py`) — прикладной слой поверх двух
+предыдущих:
 
-- `remember`: computes a deterministic ID first and checks for an **exact**
-  duplicate via `fetch_vectors` (no embedding call needed for that check).
-  If none exists, it creates exactly one embedding and looks for a
-  **semantic** duplicate via a `top_k=1` query scoped to the user's
-  namespace. A semantic duplicate is only ever **skipped**, never used to
-  update or overwrite the existing vector.
-  - stored metadata is a fixed, safe set: `user_id`, `text`, `content_hash`,
-    `created_at` (UTC ISO-8601), `source`, `record_type`, and the optional
-    Telegram fields (only when present). Bot responses, API keys, tokens,
-    full Telegram update objects, prompts, and chat history are never
-    stored.
-- `recall`: queries only the requested user's namespace with a
-  `record_type` metadata filter, and parses stored metadata strictly into
-  `RecalledMemory` -- malformed stored metadata raises
-  `StoredMemoryFormatError` rather than being silently fabricated.
-- `forget_user`: deletes only that user's namespace. Never touches another
-  user's namespace and never deletes the Pinecone index itself. Deletion is
-  idempotent: deleting a namespace with no data (e.g. a user who was already
-  forgotten, or never had any memories) is treated as success, not a
-  failure -- Telegram's `/forget_me` command and the synthetic smoke-test
-  cleanup below both rely on this. Non-not-found infrastructure errors
-  (authentication, authorization, rate-limit, network, or server failures)
-  still fail honestly as `VectorStorageError`.
+- `remember` — сохранение памяти с проверкой дедупликации;
+- `recall` — извлечение релевантных воспоминаний пользователя;
+- построение namespace пользователя;
+- `get_memory_count` — количество сохраненных записей;
+- `forget_user` — удаление памяти пользователя;
+- единая точка входа, которую использует Telegram-слой.
 
-**Current limitation:** for this educational MVP, every valid, non-empty
-message passed to `remember` is considered eligible for memory -- there is
-no separate classifier deciding whether a message is "worth remembering".
+**ChatService** (`chat_service.py`) — генерация ответа:
 
-### PineconeManager (infrastructure, from Stage 2)
+- использует `AsyncOpenAI` для асинхронных вызовов Chat Completions API;
+- передает воспоминания как JSON-массив, явно помеченный как недоверенные
+  данные, а не инструкции;
+- требует отвечать на языке текущего пользовательского сообщения;
+- для сообщений на русском языке требует естественный, грамматически
+  корректный ответ без буквальных переводов и англоязычных калек.
 
-`PineconeManager` is a typed infrastructure adapter responsible for:
+**bot.py** — Telegram-слой на aiogram 3:
 
-- validating the configured Pinecone index (name, host, dimension, metric,
-  ready state) exactly once at manager instantiation;
-- generating and validating embeddings via an OpenAI-compatible client;
-- namespace-scoped vector upsert, query (by vector or by text), fetch, and
-  deletion;
-- reading index-wide stats.
+- `Router` и `Dispatcher`, регистрация обработчиков команд;
+- маршрутизация обычных текстовых, командных и нетекстовых сообщений;
+- оркестрация вызовов `MemoryService` и `ChatService`;
+- разбиение длинных ответов на части (UTF-16 splitting);
+- безопасное логирование событий.
 
-`PineconeManager` targets the index by its **resolved host** (returned by
-`describe_index`), not by index name, because Pinecone's data-plane API is
-served per-host; resolving the host once and caching the data client avoids
-a `describe_index` round trip on every read or write.
+Поток обработки обычного текстового сообщения:
 
-Cosine similarity is conceptually normalized to [-1, 1], but the Pinecone SDK
-returns ordinary floating-point values, and external floating-point
-arithmetic can produce a microscopic boundary drift on an exact self-match
-(e.g. `1.0000001` instead of `1.0`). `PineconeManager` clamps only scores
-within `1e-6` of +-1 to the exact boundary when parsing a query response;
-materially invalid scores (e.g. `1.01`) and non-finite scores (`NaN`,
-+-infinity) still raise `VectorQueryError`. This tolerance applies only to
-this external-response boundary -- it does not alter the semantic duplicate
-threshold, `MemoryPolicy`'s classification logic, or the strict `[-1, 1]`
-contract enforced by `VectorMatch`, `MemoryWriteResult`, and
-`RecalledMemory`.
-
-External clients (Pinecone, OpenAI) are created lazily, only when a
-`PineconeManager` is instantiated -- never at module import time. The
-constructor accepts pre-built clients via dependency injection, so unit
-tests run entirely against fakes/mocks and require no live credentials or
-network access. The same is true of `MemoryService`: it creates no clients
-of its own and only reuses the `PineconeManager` it is given.
-
-`PineconeManager` remains infrastructure only: it has no concept of
-duplicate detection or memory-write policy, and never returns a
-`MemoryWriteResult` itself -- that decision now lives in `MemoryPolicy` and
-`MemoryService`.
-
-Cosine similarity scores returned from queries range from **-1 to 1**
-(`VectorMatch.score`, `MemoryWriteResult.similarity_score`,
-`RecalledMemory.score`). The configured duplicate *threshold* in `Settings`
-(`MEMORY_SIMILARITY_THRESHOLD`) remains constrained to **0 to 1**, since
-deduplication only ever cares about positive similarity.
-
-### What's still pending
-
-Telegram integration (handlers, bot commands, chat completion) has **not**
-been implemented yet. The bot is not runnable as a Telegram bot at this
-stage -- only the storage, policy, and application layers exist.
-
-## Stage 4A: live calibration and smoke-test tooling
-
-Stage 4A adds two small, standalone operator scripts under `scripts/` that
-make **real** Pinecone and OpenAI API calls -- unlike every other layer in
-this project, which is covered purely by offline unit tests against
-fakes/mocks. Both scripts only construct `Settings` / `PineconeManager` /
-`MemoryService` inside their `main()` function, never at import time, and
-both clean up every piece of data they write, in a `finally` block, even on
-partial failure. Neither script can delete the Pinecone index itself.
-
-### Pinecone index requirements
-
-Before running either script, the configured Pinecone index must already
-exist with:
-
-- **1536 dimensions** (matching the default embedding model,
-  `text-embedding-3-small`);
-- **metric: cosine**.
-
-### Local configuration
-
-Create `.env` from `.env.example` (see the [Configuration](#configuration)
-section below) and fill in real `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`,
-`OPENAI_API_KEY`, and `OPENAI_CHAT_MODEL`. **Never commit `.env`** -- it is
-already excluded via `.gitignore`.
-
-### Eventual consistency: bounded visibility polling
-
-Pinecone is **eventually consistent**: an acknowledged upsert or delete does
-not guarantee that a subsequent query or fetch immediately reflects it. A
-live calibration run once observed exactly this -- a reference upsert was
-acknowledged, the immediate filtered query returned zero matches, and
-cleanup still completed successfully. That is not a semantic-score failure;
-it is a timing gap between write acknowledgment and read visibility.
-
-Both scripts handle every read-after-write and read-after-delete boundary
-with **bounded polling** instead of a single immediate check or a fixed
-sleep: they re-issue the same read (never a new upsert, and never a
-recreated embedding) at a configurable interval until it succeeds or a
-configurable timeout elapses.
-
-```bash
-python scripts/calibrate_similarity.py --consistency-timeout 30 --poll-interval 2
-python scripts/smoke_test_memory.py --consistency-timeout 30 --poll-interval 2
+```
+получить текст
+-> извлечь релевантную память пользователя (recall)
+-> сгенерировать ответ (ChatService)
+-> отправить все части ответа в Telegram
+-> сохранить исходное сообщение пользователя (remember)
 ```
 
-- `--consistency-timeout` (default `20.0` seconds): the maximum time to wait
-  for visibility before failing with a clear, non-zero exit code.
-- `--poll-interval` (default `1.0` second): the pause between polling
-  attempts. Must be positive and no greater than `--consistency-timeout`.
+`remember` выполняется строго после отправки ответа, и на это есть причины:
 
-This retry handling only affects *when* a read is trusted -- it never
-changes a semantic score, the duplicate threshold, or the deduplication
-policy itself. A reported score is always the Pinecone-returned score from
-the query that first observed the write; nothing here re-derives or
-adjusts it.
+- текущее сообщение не должно попадать в retrieval для собственного же ответа;
+- если отправка ответа завершилась ошибкой, сообщение не должно сохраняться;
+- `remember` вызывается только после того, как все части ответа (chunks)
+  успешно отправлены в Telegram.
 
-### Calibration: measuring real cosine scores
+## Структура проекта
 
-`scripts/calibrate_similarity.py` embeds four fixed, realistic
-Russian-language phrase pairs (a likely paraphrase, a related-but-distinct
-preference, a potentially conflicting preference, and an unrelated
-statement), measures the real Pinecone cosine score for each, and prints a
-table plus a JSON summary. All calibration data is written to a throwaway
-`calibration-<uuid>` namespace and **deleted in a `finally` block** before
-the script exits, regardless of success or failure.
-
-```bash
-python scripts/calibrate_similarity.py
+```
+src/telegram_vector_memory_bot/
+    config.py            # типизированные настройки (pydantic-settings)
+    models.py             # доменные модели и перечисления
+    pinecone_manager.py    # инфраструктурный адаптер над Pinecone и OpenAI
+    memory_policy.py        # чистая логика дедупликации
+    memory_service.py        # прикладной слой памяти (remember/recall/forget_user)
+    chat_service.py           # генерация ответа через Chat Completions API
+    bot.py                     # aiogram-приложение и точка входа
+scripts/
+    smoke_test_memory.py        # live smoke-test (реальные Pinecone/OpenAI вызовы)
+    calibrate_similarity.py      # live-калибровка порога semantic deduplication
+tests/                              # offline unit-тесты
 ```
 
-After each reference upsert, the script polls the same exact `pair_id`
-filtered query -- bounded by `--consistency-timeout` / `--poll-interval` --
-until exactly one match appears, never recreating the reference or
-candidate embedding and never repeating the upsert while it waits. More
-than one match is treated as a malformed calibration state and fails
-immediately, without retrying. If no match ever becomes visible, the script
-raises a visibility timeout error and still cleans up the temporary
-namespace before exiting.
+## Требования
 
-The script's `calibration_interpretation` output labels each pair
-positive/duplicate-like (`A_likely_paraphrase`, `B_related_preference`) or
-negative/should-remain-separate (`C_potential_conflict`, `D_unrelated`) by
-its fixed category -- never by its own score -- then reports
-`minimum_positive_score`, `maximum_negative_score`, and whether
-`separation_exists` (every negative score below every positive score) for
-*this run*. When it does, `candidate_threshold_interval` is the half-open
-interval `(maximum_negative_score, minimum_positive_score]` implied by that
-run's numbers. When it doesn't, `candidate_threshold_interval` is `null` and
-the note says plainly that no single cosine threshold separates that run's
-examples -- the script never fabricates a recommendation from data that
-doesn't support one.
+- Python 3.11 или новее (см. `requires-python` в `pyproject.toml`);
+- aiogram 3 как Telegram-framework;
+- заранее созданный и готовый (ready) Pinecone index.
 
-One live calibration run against `text-embedding-3-small` did show
-separation: both positive-labeled pairs scored higher than both
-negative-labeled pairs, producing an approximate working interval of
-roughly **0.40 to 0.51**. `MEMORY_SIMILARITY_THRESHOLD` defaults to **0.50**
-in `.env.example` for that reason -- it sits inside that observed interval,
-close to the boundary shared with the lowest-scoring positive example. The
-report's `selected_project_threshold` field always reflects the live,
-currently configured `Settings.MEMORY_SIMILARITY_THRESHOLD` value (never a
-value hardcoded independently of it), and calibration never edits `.env`
-itself -- choosing and applying a threshold stays a manual, human step.
+## Установка
 
-This default is specific to the current embedding model
-(`text-embedding-3-small`) and to this project's small, fixed calibration
-scenario -- it is not a universal constant. A single cosine threshold also
-cannot be expected to distinguish every merely *related* fact from a true
-duplicate in every case (see `C_potential_conflict`, which is related but
-should never be silently merged with its reference). Recalibrate -- rerun
-`calibrate_similarity.py` and re-review its interpretation -- whenever the
-embedding model changes, or whenever the memory deduplication policy
-changes in a way that could shift what "duplicate enough" means.
+PowerShell, из корня репозитория:
 
-### Smoke test: end-to-end MemoryService validation
-
-`scripts/smoke_test_memory.py` runs `remember` / `recall` / `forget_user`
-through a synthetic Telegram user ID (default `900000001`, a placeholder
-that is never a real Telegram user). It cleans that user's namespace both
-before and after the run, so it never leaves data behind and never touches
-another namespace.
-
-The initial cleanup relies on `forget_user`/`delete_namespace` being
-idempotent: on a fresh Pinecone project (or after a prior run already
-cleaned up), the synthetic namespace does not exist yet, and that absence is
-treated as a successfully deleted namespace rather than a script failure.
-A genuine infrastructure error during cleanup (bad credentials, rate
-limiting, a Pinecone server error, and so on) still aborts the run.
-
-```bash
-python scripts/smoke_test_memory.py
-python scripts/smoke_test_memory.py --require-semantic-skip
-```
-
-Without `--require-semantic-skip`, the script does not fail just because
-the paraphrase step was classified as a new memory instead of a semantic
-duplicate under the current threshold -- that classification is exactly
-what calibration is for. With the flag, the paraphrase step **must** be
-classified as `skipped/semantic_duplicate`, or the script fails.
-
-Every read-after-write and read-after-delete boundary is bounded-polled
-before the script trusts it: the first memory must become fetch-visible
-before the exact-duplicate check, and query-visible before the paraphrase
-step. Recall acceptance requires more than a merely non-empty result: an
-older, unrelated memory can already be query-visible while the newly
-inserted training memory (`"По будням я обычно тренируюсь вечером."`) is
-not yet visible, so a non-empty result that does not contain that memory's
-exact ID is treated as not-yet-consistent, not as success. The script polls
-until that ID appears in the recall results for the fixed acceptance query
-(`"Когда мне удобнее заниматься спортом?"`) -- accounting for Pinecone's
-delayed query visibility without ever reinserting the memory or repeating
-`remember()` while waiting. Any rank within the configured `MEMORY_TOP_K`
-window is accepted, and the observed one-based rank is reported as
-`expected_recall_rank`: dense vector retrieval alone does not guarantee the
-newly inserted memory is the single closest match, and reranking is outside
-the current homework scope (it could be added later if strict top-1
-relevance becomes a requirement), so a successful run may legitimately
-report rank 2 (or any other rank up to `MEMORY_TOP_K`) rather than rank 1.
-Recall after `forget_user` must separately become empty (a single stale, non-empty
-recall result right after deletion is not treated as a cleanup failure).
-The `finally`-block safety net still always runs; if the main scenario
-already failed and the safety net's own cleanup also times out, the
-original scenario failure is what the script reports -- the safety net's
-failure is logged, never substituted in its place.
-
-### Still pending
-
-Telegram integration and chat completion remain unimplemented. These two
-scripts validate the storage and policy layers against real Pinecone/OpenAI
-credentials; they do not exercise any Telegram code path.
-
-## Requirements
-
-- Python 3.11 or newer.
-
-## Installation
-
-```bash
+```powershell
 python -m venv .venv
-.venv\Scripts\activate      # Windows
-source .venv/bin/activate   # macOS / Linux
+.\.venv\Scripts\Activate.ps1
 
-pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-## Configuration
+Зависимости и dev-зависимости описаны только в `pyproject.toml`; отдельного
+файла со списком зависимостей проект не использует.
 
-Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
+## Настройка Pinecone
 
-```bash
-copy .env.example .env   # Windows
-cp .env.example .env     # macOS / Linux
+Перед запуском бота Pinecone index должен быть создан заранее и находиться
+в состоянии ready. Требования к index:
+
+- `metric` должен быть `cosine`;
+- размерность (`dimension`) должна соответствовать embedding model. Для
+  `text-embedding-3-small` (модель по умолчанию) размерность равна **1536**.
+
+`PineconeManager` проверяет эти условия при подключении и откажется
+работать, если index не готов, использует другую метрику или имеет
+несовпадающую размерность.
+
+Стандартный формат namespace одного пользователя:
+
+```
+telegram-user-{telegram_user_id}
 ```
 
-See `.env.example` for the full list of supported variables, including
-Pinecone, OpenAI, Telegram, and memory-related settings.
+где `telegram-user` — значение `MEMORY_NAMESPACE_PREFIX` по умолчанию, а
+`{telegram_user_id}` — числовой Telegram user ID.
 
-## Development checks
+## Переменные окружения
 
-```bash
-pytest
-ruff check .
+Настройки описаны в `config.py` (`Settings`) и читаются из `.env` (см.
+`.env.example`).
+
+Обязательные (без значения по умолчанию):
+
+| Переменная | Назначение |
+|---|---|
+| `PINECONE_API_KEY` | ключ доступа к Pinecone (SecretStr) |
+| `PINECONE_INDEX_NAME` | имя сконфигурированного index |
+| `OPENAI_API_KEY` | ключ доступа к OpenAI-compatible API (SecretStr) |
+| `OPENAI_CHAT_MODEL` | название chat-модели для генерации ответов |
+| `TELEGRAM_BOT_TOKEN` | токен Telegram-бота (SecretStr) |
+
+Необязательные или имеющие значение по умолчанию:
+
+| Переменная | Значение по умолчанию | Назначение |
+|---|---|---|
+| `OPENAI_BASE_URL` | не задано (`None`) | OpenAI-compatible endpoint; можно оставить пустым, тогда используется стандартный OpenAI endpoint |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | модель для генерации embeddings |
+| `MEMORY_SIMILARITY_THRESHOLD` | `0.50` | порог semantic deduplication, от 0 до 1 |
+| `MEMORY_TOP_K` | `5` | сколько ближайших записей запрашивать при retrieval, от 1 до 20 |
+| `MEMORY_NAMESPACE_PREFIX` | `telegram-user` | префикс namespace пользователя |
+| `LOG_LEVEL` | `INFO` | уровень логирования |
+
+Важные детали валидации:
+
+- поля типа `SecretStr` (`PINECONE_API_KEY`, `OPENAI_API_KEY`,
+  `TELEGRAM_BOT_TOKEN`) не могут быть пустыми или состоять только из
+  пробелов — при нарушении настройки не загрузятся;
+- `OPENAI_BASE_URL`, если задан, должен быть валидным `http(s)` URL; пустая
+  строка или отсутствие переменной трактуются как «использовать стандартный
+  OpenAI endpoint»;
+- `MEMORY_SIMILARITY_THRESHOLD` обязан быть в диапазоне от 0 до 1;
+- `MEMORY_TOP_K` обязан быть целым числом от 1 до 20;
+- `MEMORY_NAMESPACE_PREFIX` может содержать только латинские буквы, цифры,
+  дефис и подчеркивание.
+
+Секреты (реальные ключи и токены) в этом README не приводятся — заполните их
+самостоятельно в локальном `.env`, который не должен попадать в Git.
+
+## Запуск бота
+
+Из корня репозитория:
+
+```powershell
+.\.venv\Scripts\python.exe -m telegram_vector_memory_bot.bot
 ```
 
-## Privacy principles
+Важно:
 
-- Each Telegram user's memories are isolated in a separate Pinecone
-  namespace.
-- Bot responses are never stored as user memory -- only user-provided
-  statements are eligible for storage.
-- No secrets, tokens, or API keys are stored in this repository.
-- Deletion of a user's memory will be supported.
-- Semantic similarity alone will never silently overwrite an existing
-  memory; overwriting requires an explicit, deliberate action.
+- `.env` загружается относительно текущей рабочей директории — команду нужно
+  запускать именно из корня репозитория;
+- после запуска процесс остается занят long polling (постоянным опросом
+  Telegram API) и не завершается сам по себе;
+- остановка — через `Ctrl+C`;
+- нельзя одновременно запускать два long polling процесса с одним и тем же
+  `TELEGRAM_BOT_TOKEN` — Telegram не допускает параллельный polling для
+  одного бота.
+
+## Команды Telegram
+
+| Команда | Поведение |
+|---|---|
+| `/start` | приветствие и краткое описание возможностей бота |
+| `/help` | список доступных команд и краткое объяснение обычных сообщений |
+| `/memory` | показывает общее число сохраненных записей в namespace текущего пользователя (через Pinecone index stats, а не через retrieval); тексты воспоминаний не выводятся |
+| `/forget_me` | удаляет namespace только текущего пользователя; повторное удаление уже пустого namespace считается успешным |
+
+Дополнительно:
+
+- неизвестная, но синтаксически корректная команда (например, `/foo`)
+  получает безопасную подсказку перейти к `/help`;
+- некорректный slash-текст (например, `/foo-bar`, где дефис не входит в
+  допустимые символы имени команды) молча игнорируется — ответа не будет;
+- нетекстовые сообщения (фото, стикеры, документы, голосовые сообщения и
+  т.д.) получают фиксированный ответ о том, что поддерживаются только
+  текстовые сообщения.
+
+## Как работает память
+
+- каждый Telegram-пользователь работает только в своем namespace, полностью
+  изолированном от других пользователей;
+- перед генерацией ответа выполняется retrieval — поиск релевантных
+  воспоминаний пользователя по embedding текущего сообщения;
+- после успешной отправки ответа исходное сообщение пользователя
+  рассматривается для сохранения — с учетом дедупликации (см. ниже);
+- ответы самого бота никогда не сохраняются как память.
+
+## Дедупликация
+
+Exact duplicate (точный дубликат):
+
+- нормализованный текст преобразуется в content hash;
+- если запись с таким же content hash уже существует в namespace
+  пользователя, новая запись не создается:
+
+  ```
+  action=skipped
+  reason=exact_duplicate
+  ```
+
+Semantic duplicate (смысловой дубликат):
+
+- для текста создается embedding;
+- выполняется поиск ближайшей существующей записи в namespace
+  пользователя;
+- если найденный score (значение cosine similarity) больше или равен
+  `MEMORY_SIMILARITY_THRESHOLD`, запись пропускается:
+
+  ```
+  action=skipped
+  reason=semantic_duplicate
+  ```
+
+Новая память:
+
+- если ни exact, ни semantic дубликат не найдены:
+
+  ```
+  action=inserted
+  reason=new_memory
+  ```
+
+Текущий откалиброванный порог: **`MEMORY_SIMILARITY_THRESHOLD = 0.50`**.
+
+Важные ограничения:
+
+- смысловая близость (similarity) зависит от конкретной embedding model и
+  не является гарантией логической эквивалентности утверждений;
+- противоположные по смыслу утверждения **не перезаписывают** друг друга
+  автоматически — новое утверждение сохраняется как отдельная запись, если
+  ровно одна из двух сравниваемых записей содержит явное отрицание (например,
+  «не», «нет», «никогда», «not», «never»), а другая нет;
+- таким образом противоположные факты могут сосуществовать как отдельные
+  записи в памяти пользователя — это осознанное поведение MVP, а не ошибка;
+- MVP никогда не возвращает результат с action=updated — обновление
+  существующего вектора по similarity в текущей версии не происходит:
+  дедупликация может только вставить новую запись (`inserted`) или
+  пропустить дубликат (`skipped`).
+
+## Извлечение памяти и генерация ответа
+
+- перед генерацией ответа выполняется top-k retrieval (поиск `MEMORY_TOP_K`
+  ближайших записей) в namespace текущего пользователя;
+- найденные воспоминания передаются chat model как JSON-массив текстов;
+- текущее сообщение пользователя передается отдельным сообщением с ролью
+  `user`;
+- язык текущего сообщения пользователя определяет язык ответа;
+- для русского языка требуется естественный и грамматически корректный
+  ответ без буквальных переводов и англоязычных калек;
+- если память пуста, модель не должна утверждать, что ей известны какие-либо
+  факты о пользователе.
+
+В prompt передается **только текст воспоминаний**. Никогда не передаются:
+Telegram user ID, username, first_name, last_name, vector ID, content hash,
+score, timestamp, namespace, API keys, Telegram token.
+
+## Безопасность промпта
+
+- JSON-массив воспоминаний явно маркирован в системном сообщении как
+  недоверенные (untrusted) пользовательские данные, а не инструкции;
+- модели явно указано никогда не выполнять, не следовать и не трактовать
+  как команду ничего из содержимого этого массива;
+- текущее сообщение пользователя — единственный источник, определяющий язык
+  ответа; ретривнутый контекст не может «перебить» язык ответа.
+
+## Обработка cosine score
+
+- cosine score (значение cosine similarity) номинально находится в
+  диапазоне `[-1, 1]`;
+- Pinecone иногда возвращает значение с небольшим floating-point
+  превышением этой границы (например, реально наблюдавшееся `1.0003202`);
+- значения в пределах фиксированного допуска `1e-3` нормализуются до
+  ближайшей границы (`-1.0` или `1.0`);
+- значения, выходящие за пределы допуска, а также `NaN`, `infinity`, `bool`
+  и значения неверного типа по-прежнему отклоняются с ошибкой;
+- этот допуск — фиксированная техническая коррекция ответа внешнего API; он
+  никак не изменяет `MEMORY_SIMILARITY_THRESHOLD` и не влияет на логику
+  дедупликации.
+
+## Приватность и логирование
+
+- каждый Telegram-пользователь использует отдельный Pinecone namespace;
+- API keys и Telegram token никогда не сохраняются в Pinecone;
+- ответы бота никогда не сохраняются как память — только сообщения
+  пользователя;
+- полные объекты Telegram `Message` и `Update` не сохраняются;
+- `username`, `first_name` и `last_name` могут сохраняться как
+  необязательные (optional) поля метаданных, только если они присутствуют
+  в исходном сообщении;
+- тексты сообщений, воспоминаний и ответов не пишутся в логи приложения;
+- успешная запись в память логируется только тремя полями: `action`,
+  `reason`, `similarity_score` — без текста самой записи;
+- логи ошибок содержат только безопасное имя события и имя класса
+  исключения, без текста сообщений и без содержимого исключения;
+- `/forget_me` удаляет память только текущего пользователя и не
+  затрагивает другие namespace.
+
+## Тестирование
+
+Offline unit-тесты (без реальных сетевых вызовов — Telegram, OpenAI и
+Pinecone заменены на mocks/fakes):
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m pip check
+```
+
+Подтвержденный результат финального offline gate:
+
+- **493 passed**;
+- **99% coverage**;
+- **Ruff passed**;
+- **pip check passed**.
+
+Live smoke-test (использует реальные OpenAI embeddings и Pinecone
+операции):
+
+```powershell
+.\.venv\Scripts\python.exe scripts/smoke_test_memory.py --require-semantic-skip
+```
+
+Пояснения:
+
+- smoke-test использует синтетический (заведомо не реальный) namespace
+  пользователя;
+- после выполнения все тестовые данные удаляются;
+- с флагом `--require-semantic-skip` шаг с перефразированным утверждением
+  обязан быть классифицирован как `skipped`/`semantic_duplicate` — иначе
+  скрипт завершится с ошибкой;
+- ожидаемая новая память считается найденной в результатах retrieval, если
+  ее точный ID присутствует среди `MEMORY_TOP_K` результатов — необязательно
+  на первой позиции.
+
+## Ручная приемка
+
+Основные пользовательские сценарии проверены вручную в реальном Telegram.
+Обработка отсутствующих optional Telegram-полей дополнительно подтверждена
+offline-тестами, а не отдельным live-сценарием — оба Telegram-аккаунта,
+использованные для live-проверки, имели заполненные `username`, `first_name`
+и `last_name`.
+
+| Сценарий | Ожидаемый результат | Статус |
+|---|---|---|
+| Запуск бота и подключение к Pinecone | long polling запускается без ошибок | PASS |
+| `/start`, `/help`, `/memory`, `/forget_me` | все команды отвечают корректно | PASS |
+| Первая новая память | `action=inserted`, `reason=new_memory` | PASS |
+| Точный дубликат того же текста | `action=skipped`, `reason=exact_duplicate` | PASS |
+| Смысловая переформулировка | `action=skipped`, `reason=semantic_duplicate` | PASS |
+| Противоположное утверждение | сохраняется как новая память, старое не перезаписывается | PASS |
+| Новый несвязанный факт | `action=inserted`, `reason=new_memory` | PASS |
+| Использование retrieved memory в ответе | ответ учитывает ранее сохраненный факт | PASS |
+| Необязательные Telegram-поля (`username`, `first_name`, `last_name`) | отсутствие полей не ломает обработку; подтверждено offline-тестами | PASS |
+| Два разных Telegram-пользователя | у каждого свой изолированный Pinecone namespace | PASS |
+| `/memory` после нескольких сохранений | возвращает корректное число записей | PASS |
+| `/forget_me` | удаляет namespace только текущего пользователя; `/memory` после этого возвращает 0 записей | PASS |
+| Неизвестная корректная команда | безопасная подсказка перейти к `/help` | PASS |
+| Некорректный slash-текст (`/foo-bar`) | молча игнорируется | PASS |
+| Нетекстовое сообщение | фиксированный ответ о поддержке только текста | PASS |
+
+Скриншоты live-приемки подготовлены отдельно для учебной сдачи и намеренно
+**не добавлены** в этот Git-репозиторий.
+
+## Ограничения MVP
+
+- каждое обычное непустое некомандное сообщение после отправки ответа
+  рассматривается для сохранения в памяти;
+- вопросы тоже могут сохраняться, если ни exact, ни semantic dedup их не
+  отфильтруют — отдельного правила «не сохранять вопросы» нет;
+- нет отдельного classifier, решающего, стоит ли вообще запоминать
+  конкретное сообщение;
+- нет structured fact extraction (структурированного извлечения фактов из
+  текста);
+- нет автоматического разрешения противоречий между сохраненными фактами;
+- противоположные факты могут сосуществовать как отдельные записи;
+- нет удаления одной конкретной записи — только удаление всей памяти
+  целиком через `/forget_me`;
+- нет просмотра полного списка воспоминаний через Telegram;
+- нет отдельной conversation-history database;
+- нет PostgreSQL;
+- нет Docker;
+- нет webhook — используется только long polling;
+- нет VPS deployment;
+- нет web UI;
+- семантическое поведение зависит от выбранной embedding model и
+  откалиброванного порога, и может измениться при их смене.
+
+Это описание фактических границ уже реализованного контракта, а не список
+дефектов.
+
+## Возможные улучшения
+
+- memory-admission classifier (решение о том, стоит ли вообще запоминать
+  сообщение);
+- structured facts (структурированное извлечение фактов);
+- contradiction handling (обработка противоречий между фактами);
+- просмотр и удаление отдельных записей памяти;
+- webhook и полноценный deployment;
+- observability (метрики, трассировка);
+- rate limiting;
+- расширенные команды управления памятью.
