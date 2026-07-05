@@ -208,6 +208,18 @@ class MemoryService:
         namespace = self.namespace_for_user(user_id)
         self._manager.delete_namespace(namespace)
 
+    def get_memory_count(self, *, user_id: int) -> int:
+        """Return the total number of stored memories for *user_id*.
+
+        Uses Pinecone's index statistics for *user_id*'s namespace -- never
+        ``recall``/``query_by_text`` -- since recall only returns up to
+        ``top_k`` query-relevant results, not the true total count.
+        """
+        if user_id <= 0:
+            raise ValueError("user_id must be positive")
+        namespace = self.namespace_for_user(user_id)
+        return self._manager.get_namespace_vector_count(namespace=namespace)
+
 
 def _build_metadata(record: MemoryRecord) -> dict[str, Any]:
     """Build the safe, storage-ready metadata for a memory record.

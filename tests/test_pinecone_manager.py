@@ -1317,6 +1317,193 @@ def test_stats_pinecone_exception_wrapped(
     assert exc_info.value.__cause__ is original
 
 
+# ---------------------------------------------------------------------------
+# get_namespace_vector_count
+# ---------------------------------------------------------------------------
+
+
+def test_namespace_vector_count_returned(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {
+        "namespaces": {"user-1": {"vector_count": 7}}
+    }
+
+    count = manager.get_namespace_vector_count(namespace="user-1")
+
+    assert count == 7
+
+
+def test_namespace_vector_count_absent_namespace_returns_zero(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {
+        "namespaces": {"some-other-user": {"vector_count": 3}}
+    }
+
+    count = manager.get_namespace_vector_count(namespace="user-1")
+
+    assert count == 0
+
+
+def test_namespace_vector_count_present_key_mapped_to_none_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    # The key genuinely exists in the response but its value is null -- a
+    # malformed/broken response, not an empty namespace -- must not be
+    # silently treated as a count of 0.
+    fake_pinecone._index_handle.stats_response = {"namespaces": {"user-1": None}}
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_present_malformed_summary_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    # The key is present but its value has no usable 'vector_count' at all.
+    fake_pinecone._index_handle.stats_response = {"namespaces": {"user-1": 12345}}
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_empty_namespaces_mapping_returns_zero(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {"namespaces": {}}
+
+    count = manager.get_namespace_vector_count(namespace="user-1")
+
+    assert count == 0
+
+
+def test_namespace_vector_count_mapping_style_response_supported(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {
+        "total_vector_count": 7,
+        "namespaces": {"user-1": {"vector_count": 7}},
+    }
+
+    count = manager.get_namespace_vector_count(namespace="user-1")
+
+    assert count == 7
+
+
+def test_namespace_vector_count_attribute_style_response_supported(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = SimpleNamespace(
+        namespaces={"user-1": SimpleNamespace(vector_count=9)}
+    )
+
+    count = manager.get_namespace_vector_count(namespace="user-1")
+
+    assert count == 9
+
+
+def test_namespace_vector_count_bool_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {
+        "namespaces": {"user-1": {"vector_count": True}}
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_negative_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {
+        "namespaces": {"user-1": {"vector_count": -1}}
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_non_integral_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {
+        "namespaces": {"user-1": {"vector_count": 7.5}}
+    }
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_missing_vector_count_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {"namespaces": {"user-1": {}}}
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_missing_namespaces_key_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {"total_vector_count": 0}
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_non_mapping_namespaces_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {"namespaces": "not-a-mapping"}
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_unparseable_response_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = 12345
+
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="user-1")
+
+
+def test_namespace_vector_count_pinecone_exception_wrapped(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    original = RuntimeError("stats failed")
+    fake_pinecone._index_handle.raise_on_stats = original
+
+    with pytest.raises(VectorQueryError) as exc_info:
+        manager.get_namespace_vector_count(namespace="user-1")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_namespace_vector_count_blank_namespace_rejected(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    with pytest.raises(VectorQueryError):
+        manager.get_namespace_vector_count(namespace="   ")
+
+
+def test_namespace_vector_count_no_query_or_embedding_call_made(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient, fake_openai: FakeOpenAIClient
+) -> None:
+    fake_pinecone._index_handle.stats_response = {
+        "namespaces": {"user-1": {"vector_count": 2}}
+    }
+
+    manager.get_namespace_vector_count(namespace="user-1")
+
+    assert fake_pinecone._index_handle.query_calls == []
+    assert fake_openai.embeddings.calls == []
+
+
 def test_importing_package_does_not_create_external_clients(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

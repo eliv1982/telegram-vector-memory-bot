@@ -469,3 +469,45 @@ class PineconeManager:
             return _to_plain_dict(response)
         except TypeError as exc:
             raise VectorQueryError("describe_index_stats response could not be parsed") from exc
+
+    def get_namespace_vector_count(self, *, namespace: str) -> int:
+        """Return the number of vectors stored in *namespace*, via index stats.
+
+        Uses Pinecone's index-wide statistics -- never a query or fetch --
+        so this reflects the true stored count rather than a top-k sample.
+        A namespace *key absent* from the response (including one that has
+        never existed) returns 0, matching how ``describe_index_stats``
+        itself omits empty namespaces from its 'namespaces' mapping. A
+        namespace key that *is* present but maps to ``None`` or a malformed
+        summary is a different condition -- a broken response, not an empty
+        namespace -- and still raises ``VectorQueryError``.
+        """
+        namespace = _require_non_empty_str(namespace, "namespace", VectorQueryError)
+
+        try:
+            response = self._index.describe_index_stats()
+        except Exception as exc:
+            raise VectorQueryError("describe_index_stats request failed") from exc
+
+        namespaces = _get_field(response, "namespaces")
+        if namespaces is _MISSING or namespaces is None:
+            raise VectorQueryError(
+                "describe_index_stats response is missing a 'namespaces' mapping"
+            )
+        if not isinstance(namespaces, Mapping):
+            raise VectorQueryError("describe_index_stats response 'namespaces' must be a mapping")
+
+        if namespace not in namespaces:
+            return 0
+
+        namespace_stats = namespaces[namespace]
+        if namespace_stats is None:
+            raise VectorQueryError("namespace summary must not be null")
+
+        count = _get_field(namespace_stats, "vector_count")
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise VectorQueryError("namespace vector_count must be a non-boolean integer")
+        if count < 0:
+            raise VectorQueryError("namespace vector_count must not be negative")
+
+        return count

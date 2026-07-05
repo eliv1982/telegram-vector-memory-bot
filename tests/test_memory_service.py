@@ -44,11 +44,13 @@ class FakeManager:
         self.query_by_text_calls: list[dict[str, Any]] = []
         self.upsert_calls: list[dict[str, Any]] = []
         self.delete_calls: list[str] = []
+        self.namespace_vector_count_calls: list[str] = []
 
         self.fetch_response: dict[str, dict[str, Any]] = {}
         self.embedding_response: list[float] = list(DEFAULT_EMBEDDING)
         self.query_by_vector_response: list[VectorMatch] = []
         self.query_by_text_response: list[VectorMatch] = []
+        self.namespace_vector_count_response: int = 0
 
         self.raise_on_fetch: Exception | None = None
         self.raise_on_create_embedding: Exception | None = None
@@ -56,6 +58,7 @@ class FakeManager:
         self.raise_on_query_by_text: Exception | None = None
         self.raise_on_upsert: Exception | None = None
         self.raise_on_delete: Exception | None = None
+        self.raise_on_namespace_vector_count: Exception | None = None
 
     def fetch_vectors(
         self, *, vector_ids: Sequence[str], namespace: str
@@ -134,6 +137,12 @@ class FakeManager:
         self.delete_calls.append(namespace)
         if self.raise_on_delete is not None:
             raise self.raise_on_delete
+
+    def get_namespace_vector_count(self, *, namespace: str) -> int:
+        self.namespace_vector_count_calls.append(namespace)
+        if self.raise_on_namespace_vector_count is not None:
+            raise self.raise_on_namespace_vector_count
+        return self.namespace_vector_count_response
 
 
 def _build_settings(**overrides: Any) -> Settings:
@@ -513,6 +522,70 @@ def test_forget_deletes_only_requested_user_namespace(
     service.forget_user(user_id=9)
 
     assert manager.delete_calls == ["telegram-user-9"]
+
+
+# ---------------------------------------------------------------------------
+# get_memory_count
+# ---------------------------------------------------------------------------
+
+
+def test_get_memory_count_returns_manager_result(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    manager.namespace_vector_count_response = 4
+
+    count = service.get_memory_count(user_id=1)
+
+    assert count == 4
+
+
+def test_get_memory_count_uses_exact_namespace_for_user(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    service.get_memory_count(user_id=9)
+
+    assert manager.namespace_vector_count_calls == ["telegram-user-9"]
+
+
+def test_get_memory_count_two_users_use_distinct_namespaces(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    service.get_memory_count(user_id=1)
+    service.get_memory_count(user_id=2)
+
+    assert manager.namespace_vector_count_calls == ["telegram-user-1", "telegram-user-2"]
+
+
+def test_get_memory_count_makes_no_embedding_or_query_call(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    service.get_memory_count(user_id=1)
+
+    assert manager.create_embedding_calls == []
+    assert manager.query_by_text_calls == []
+    assert manager.query_by_vector_calls == []
+
+
+@pytest.mark.parametrize("user_id", [0, -1])
+def test_get_memory_count_invalid_user_id_rejected_before_manager_calls(
+    service: MemoryService, manager: FakeManager, user_id: int
+) -> None:
+    with pytest.raises(ValueError):
+        service.get_memory_count(user_id=user_id)
+
+    assert manager.namespace_vector_count_calls == []
+
+
+def test_get_memory_count_propagates_manager_error(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    original = VectorQueryError("stats failed")
+    manager.raise_on_namespace_vector_count = original
+
+    with pytest.raises(VectorQueryError) as exc_info:
+        service.get_memory_count(user_id=1)
+
+    assert exc_info.value is original
 
 
 # ---------------------------------------------------------------------------
