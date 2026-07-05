@@ -28,7 +28,7 @@ _MIN_TOP_K: Final = 1
 _MAX_TOP_K: Final = 20
 _EXPECTED_METRIC: Final = "cosine"
 _NOT_FOUND_STATUS: Final = 404
-_COSINE_SCORE_EPSILON: Final = 1e-6
+_COSINE_SCORE_EPSILON: Final = 1e-3
 
 _MISSING: Final = object()
 
@@ -156,13 +156,15 @@ def _normalize_cosine_score(score: Any, error_cls: type[VectorMemoryError]) -> f
     """Normalize a raw Pinecone query-match score to the canonical [-1, 1] range.
 
     Pinecone cosine scores are conceptually normalized to [-1, 1], but the SDK
-    returns ordinary floating-point values that can microscopically overshoot
-    that boundary (e.g. ``1.0000001``) due to floating-point arithmetic on the
-    external service. Only that microscopic drift -- within
-    ``_COSINE_SCORE_EPSILON`` of +-1 -- is clamped to the exact boundary;
-    values materially outside [-1, 1], and non-finite values, are still
-    rejected. This tolerance is specific to this external-response boundary
-    and is never applied to user input or configured thresholds.
+    returns ordinary floating-point values that can overshoot that boundary
+    due to service-side/numerical arithmetic on the external service (e.g. a
+    live-observed ``1.0003202``). Only that bounded operational overshoot --
+    within ``_COSINE_SCORE_EPSILON`` of +-1 -- is normalized to the exact
+    mathematical boundary; values materially outside [-1, 1], and non-finite
+    values, are still rejected. ``_COSINE_SCORE_EPSILON`` is a fixed, narrow
+    allowance for this specific external-response boundary -- it is not a
+    general clamp, and it is never applied to user input or configured
+    thresholds (e.g. the semantic deduplication threshold).
     """
     if isinstance(score, bool) or not isinstance(score, int | float):
         raise error_cls("query match score must be numeric")

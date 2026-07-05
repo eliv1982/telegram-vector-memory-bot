@@ -769,11 +769,13 @@ def test_query_score_exactly_negative_one_unchanged(
     assert matches[0].score == -1.0
 
 
-def test_query_score_positive_overshoot_within_epsilon_normalized(
+def test_query_score_live_observed_positive_overshoot_normalized(
     manager: PineconeManager, fake_pinecone: FakePineconeClient
 ) -> None:
+    # Real value observed against the live Pinecone index during Stage 5C
+    # acceptance: delta_from_one = 0.0003201999999999927.
     fake_pinecone._index_handle.query_response = {
-        "matches": [{"id": "mem-1", "score": 1.0000001, "metadata": {}}]
+        "matches": [{"id": "mem-1", "score": 1.0003202, "metadata": {}}]
     }
 
     matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
@@ -781,11 +783,35 @@ def test_query_score_positive_overshoot_within_epsilon_normalized(
     assert matches[0].score == 1.0
 
 
-def test_query_score_negative_overshoot_within_epsilon_normalized(
+def test_query_score_symmetric_negative_overshoot_normalized(
     manager: PineconeManager, fake_pinecone: FakePineconeClient
 ) -> None:
     fake_pinecone._index_handle.query_response = {
-        "matches": [{"id": "mem-1", "score": -1.0000001, "metadata": {}}]
+        "matches": [{"id": "mem-1", "score": -1.0003202, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == -1.0
+
+
+def test_query_score_exact_positive_tolerance_boundary_normalized(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": 1.001, "metadata": {}}]
+    }
+
+    matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
+
+    assert matches[0].score == 1.0
+
+
+def test_query_score_exact_negative_tolerance_boundary_normalized(
+    manager: PineconeManager, fake_pinecone: FakePineconeClient
+) -> None:
+    fake_pinecone._index_handle.query_response = {
+        "matches": [{"id": "mem-1", "score": -1.001, "metadata": {}}]
     }
 
     matches = manager.query_by_vector(values=VALID_VALUES, namespace="user-1", top_k=5)
@@ -797,7 +823,7 @@ def test_query_score_positive_overshoot_beyond_epsilon_rejected(
     manager: PineconeManager, fake_pinecone: FakePineconeClient
 ) -> None:
     fake_pinecone._index_handle.query_response = {
-        "matches": [{"id": "mem-1", "score": 1.00001, "metadata": {}}]
+        "matches": [{"id": "mem-1", "score": 1.0011, "metadata": {}}]
     }
 
     with pytest.raises(VectorQueryError):
@@ -808,7 +834,7 @@ def test_query_score_negative_overshoot_beyond_epsilon_rejected(
     manager: PineconeManager, fake_pinecone: FakePineconeClient
 ) -> None:
     fake_pinecone._index_handle.query_response = {
-        "matches": [{"id": "mem-1", "score": -1.00001, "metadata": {}}]
+        "matches": [{"id": "mem-1", "score": -1.0011, "metadata": {}}]
     }
 
     with pytest.raises(VectorQueryError):
@@ -918,7 +944,7 @@ def test_query_score_error_message_does_not_expose_injected_secret(
 ) -> None:
     secret = "sk-FAKE-INJECTED-SECRET-VALUE"
     fake_pinecone._index_handle.query_response = {
-        "matches": [{"id": "mem-1", "score": 1.00001, "metadata": {"text": secret}}]
+        "matches": [{"id": "mem-1", "score": 1.01, "metadata": {"text": secret}}]
     }
 
     with pytest.raises(VectorQueryError) as exc_info:
