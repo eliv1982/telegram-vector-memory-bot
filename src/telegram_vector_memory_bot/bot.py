@@ -1,15 +1,20 @@
 """aiogram 3 Telegram application layer.
 
 Wires the four Stage 5 commands and the ordinary text-message flow on top of
-the existing, synchronous ``MemoryService`` and ``ChatService``. This module
-constructs no external client and no ``Settings`` object at import time --
-everything is built inside :func:`run_bot`, which only runs when the module
-is executed as a script.
+the existing, synchronous ``MemoryService`` and the tool-using
+``HaystackAgentService``. This module constructs no external client and no
+``Settings`` object at import time -- everything is built inside
+:func:`run_bot`, which only runs when the module is executed as a script.
 
-Message flow for ordinary text: recall -> chat generation -> send every
-reply chunk -> remember, in that order. ``remember`` only ever runs after
-every reply chunk has been sent successfully; a failed send re-raises so
-aiogram's own error boundary handles it, and never triggers ``remember``.
+``ChatService`` (plain, non-tool-using Chat Completions adapter) remains in
+the codebase as a legacy adapter -- fully implemented and tested in
+``chat_service.py`` -- but is no longer wired into the live message flow.
+
+Message flow for ordinary text: recall -> agent reply generation (which may
+call tools) -> send every reply chunk -> remember, in that order.
+``remember`` only ever runs after every reply chunk has been sent
+successfully; a failed send re-raises so aiogram's own error boundary
+handles it, and never triggers ``remember``.
 """
 
 from __future__ import annotations
@@ -23,8 +28,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
-from .chat_service import ChatService, ChatServiceError
 from .config import get_settings
+from .haystack_agent import HaystackAgentService, HaystackAgentServiceError
 from .memory_service import MemoryService, MemoryServiceError
 from .pinecone_manager import PineconeManager, VectorMemoryError
 
@@ -228,14 +233,17 @@ async def handle_non_text_message(message: Message) -> None:
 async def handle_text_message(
     message: Message,
     memory_service: MemoryService,
-    chat_service: ChatService,
+    reply_service: HaystackAgentService,
 ) -> None:
     """Ordinary text-message flow: recall -> generate -> send -> remember.
 
-    ``remember`` only runs after every reply chunk has been sent
-    successfully. A send failure re-raises (after safe logging) so
-    aiogram's own error boundary handles it, and skips ``remember``
-    entirely by simply never reaching that line.
+    ``reply_service`` generates the reply; in production this is a
+    ``HaystackAgentService``, which may call a weather, currency,
+    country-info, or Wikipedia tool on its own before answering. ``remember``
+    only runs after every reply chunk has been sent successfully. A send
+    failure re-raises (after safe logging) so aiogram's own error boundary
+    handles it, and skips ``remember`` entirely by simply never reaching
+    that line.
     """
     user_text = message.text
     if not isinstance(user_text, str) or not user_text.strip():
@@ -261,8 +269,8 @@ async def handle_text_message(
         memories = []
 
     try:
-        reply = await chat_service.generate_reply(user_text=user_text, memories=memories)
-    except ChatServiceError as exc:
+        reply = await reply_service.generate_reply(user_text=user_text, memories=memories)
+    except HaystackAgentServiceError as exc:
         logger.warning("event=chat_generation_failed error_type=%s", type(exc).__name__)
         await message.answer(_CHAT_FAILURE_REPLY)
         return
@@ -320,14 +328,14 @@ def _build_router() -> Router:
 def create_dispatcher(
     *,
     memory_service: MemoryService,
-    chat_service: ChatService,
+    reply_service: HaystackAgentService,
 ) -> Dispatcher:
     """Build the Stage 5 Dispatcher with both services as contextual data.
 
-    Handlers receive *memory_service* / *chat_service* by parameter name via
+    Handlers receive *memory_service* / *reply_service* by parameter name via
     aiogram's workflow data -- no module-level mutable singleton is used.
     """
-    dispatcher = Dispatcher(memory_service=memory_service, chat_service=chat_service)
+    dispatcher = Dispatcher(memory_service=memory_service, reply_service=reply_service)
     dispatcher.include_router(_build_router())
     return dispatcher
 
@@ -337,10 +345,10 @@ async def run_bot() -> None:
     settings = get_settings()
     manager = PineconeManager(settings)
     memory_service = MemoryService(manager=manager, settings=settings)
-    chat_service = ChatService(settings=settings)
+    reply_service = HaystackAgentService(settings=settings)
 
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN.get_secret_value())
-    dispatcher = create_dispatcher(memory_service=memory_service, chat_service=chat_service)
+    dispatcher = create_dispatcher(memory_service=memory_service, reply_service=reply_service)
 
     await dispatcher.start_polling(bot)
 
