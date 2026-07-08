@@ -1,7 +1,7 @@
 """Unit tests for telegram_vector_memory_bot.bot.
 
 Most handlers are exercised directly as plain async functions against small
-duck-typed fakes (FakeMessage, FakeUser, FakeMemoryService, FakeChatService).
+duck-typed fakes (FakeMessage, FakeUser, FakeMemoryService, FakeReplyService).
 A separate "Dispatcher-fed routing" section instead drives the real,
 constructed Dispatcher end-to-end via ``feed_raw_update`` against a real
 ``aiogram.Bot`` bound to an offline fake session (FakeTelegramSession) that
@@ -33,8 +33,8 @@ from aiogram.types import Message as AiogramMessage
 from aiogram.types import User as AiogramUser
 
 from telegram_vector_memory_bot import bot as bot_module
-from telegram_vector_memory_bot.chat_service import ChatServiceError
 from telegram_vector_memory_bot.config import Settings
+from telegram_vector_memory_bot.haystack_agent import HaystackAgentServiceError
 from telegram_vector_memory_bot.models import (
     MemoryAction,
     MemoryReason,
@@ -212,8 +212,8 @@ class FakeMemoryService:
         return self.get_memory_count_response
 
 
-class FakeChatService:
-    """Duck-typed stand-in for ChatService's public API used by bot.py."""
+class FakeReplyService:
+    """Duck-typed stand-in for HaystackAgentService's public API used by bot.py."""
 
     def __init__(self, *, events: list[str] | None = None) -> None:
         self.events = events if events is not None else []
@@ -299,16 +299,16 @@ def _make_update(
 
 
 def _build_harness() -> tuple[
-    aiogram.Bot, aiogram.Dispatcher, FakeTelegramSession, FakeMemoryService, FakeChatService
+    aiogram.Bot, aiogram.Dispatcher, FakeTelegramSession, FakeMemoryService, FakeReplyService
 ]:
     session = FakeTelegramSession()
     telegram_bot = aiogram.Bot(token=FAKE_TOKEN, session=session)
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     dispatcher = bot_module.create_dispatcher(
-        memory_service=memory_service, chat_service=chat_service
+        memory_service=memory_service, reply_service=reply_service
     )
-    return telegram_bot, dispatcher, session, memory_service, chat_service
+    return telegram_bot, dispatcher, session, memory_service, reply_service
 
 
 # ---------------------------------------------------------------------------
@@ -318,10 +318,10 @@ def _build_harness() -> tuple[
 
 def test_create_dispatcher_includes_stage5_router() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
 
     dispatcher = bot_module.create_dispatcher(
-        memory_service=memory_service, chat_service=chat_service
+        memory_service=memory_service, reply_service=reply_service
     )
 
     assert any(router.name == "stage5_router" for router in dispatcher.sub_routers)
@@ -329,14 +329,14 @@ def test_create_dispatcher_includes_stage5_router() -> None:
 
 def test_create_dispatcher_exposes_services_as_workflow_data() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
 
     dispatcher = bot_module.create_dispatcher(
-        memory_service=memory_service, chat_service=chat_service
+        memory_service=memory_service, reply_service=reply_service
     )
 
     assert dispatcher.workflow_data["memory_service"] is memory_service
-    assert dispatcher.workflow_data["chat_service"] is chat_service
+    assert dispatcher.workflow_data["reply_service"] is reply_service
 
 
 def test_importing_bot_module_constructs_no_external_clients(
@@ -384,22 +384,22 @@ def test_run_bot_wires_services_in_order_and_polls_with_constructed_bot(
         assert manager == "manager-marker"
         return "memory-service-marker"
 
-    def fake_chat_service(*, settings: Settings) -> str:
-        events.append("ChatService")
-        return "chat-service-marker"
+    def fake_reply_service(*, settings: Settings) -> str:
+        events.append("HaystackAgentService")
+        return "reply-service-marker"
 
     dispatcher_instance = RecordingDispatcher()
 
-    def fake_create_dispatcher(*, memory_service: Any, chat_service: Any) -> RecordingDispatcher:
+    def fake_create_dispatcher(*, memory_service: Any, reply_service: Any) -> RecordingDispatcher:
         events.append("create_dispatcher")
         assert memory_service == "memory-service-marker"
-        assert chat_service == "chat-service-marker"
+        assert reply_service == "reply-service-marker"
         return dispatcher_instance
 
     monkeypatch.setattr(bot_module, "get_settings", lambda: fake_settings)
     monkeypatch.setattr(bot_module, "PineconeManager", fake_pinecone_manager)
     monkeypatch.setattr(bot_module, "MemoryService", fake_memory_service)
-    monkeypatch.setattr(bot_module, "ChatService", fake_chat_service)
+    monkeypatch.setattr(bot_module, "HaystackAgentService", fake_reply_service)
     monkeypatch.setattr(bot_module, "Bot", RecordingBot)
     monkeypatch.setattr(bot_module, "create_dispatcher", fake_create_dispatcher)
 
@@ -408,7 +408,7 @@ def test_run_bot_wires_services_in_order_and_polls_with_constructed_bot(
     assert events == [
         "PineconeManager",
         "MemoryService",
-        "ChatService",
+        "HaystackAgentService",
         "Bot",
         "create_dispatcher",
         "start_polling",
@@ -448,12 +448,14 @@ def test_run_bot_does_not_log_the_telegram_token(
     monkeypatch.setattr(
         bot_module, "MemoryService", lambda *, manager, settings: "memory-service-marker"
     )
-    monkeypatch.setattr(bot_module, "ChatService", lambda *, settings: "chat-service-marker")
+    monkeypatch.setattr(
+        bot_module, "HaystackAgentService", lambda *, settings: "reply-service-marker"
+    )
     monkeypatch.setattr(bot_module, "Bot", RecordingBot)
     monkeypatch.setattr(
         bot_module,
         "create_dispatcher",
-        lambda *, memory_service, chat_service: RecordingDispatcher(),
+        lambda *, memory_service, reply_service: RecordingDispatcher(),
     )
 
     with caplog.at_level(logging.DEBUG):
@@ -622,46 +624,46 @@ def test_commands_never_call_remember() -> None:
 def test_message_flow_exact_order_recall_generate_send_remember() -> None:
     events: list[str] = []
     memory_service = FakeMemoryService(events=events)
-    chat_service = FakeChatService(events=events)
+    reply_service = FakeReplyService(events=events)
     message = FakeMessage(text="hello", from_user=FakeUser(), events=events)
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert events == ["recall", "generate", "send", "remember"]
 
 
-def test_chat_service_receives_exact_memories_from_recall() -> None:
+def test_reply_service_receives_exact_memories_from_recall() -> None:
     memory_service = FakeMemoryService()
     recalled = [_recalled_memory("fact one"), _recalled_memory("fact two")]
     memory_service.recall_response = recalled
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
-    assert chat_service.generate_reply_calls[0]["memories"] == recalled
+    assert reply_service.generate_reply_calls[0]["memories"] == recalled
 
 
 def test_recall_failure_degrades_to_empty_list_and_generation_still_runs() -> None:
     memory_service = FakeMemoryService()
     memory_service.raise_on_recall = VectorQueryError("query failed")
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
-    assert chat_service.generate_reply_calls[0]["memories"] == []
-    assert message.answer_calls == [chat_service.response]
+    assert reply_service.generate_reply_calls[0]["memories"] == []
+    assert message.answer_calls == [reply_service.response]
     assert len(memory_service.remember_calls) == 1
 
 
 def test_chat_failure_sends_fallback_and_does_not_call_remember() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
-    chat_service.exception = ChatServiceError("chat completion request failed")
+    reply_service = FakeReplyService()
+    reply_service.exception = HaystackAgentServiceError("chat completion request failed")
     message = FakeMessage(text="hi", from_user=FakeUser())
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert message.answer_calls == [_CHAT_FAILURE_TEXT]
     assert memory_service.remember_calls == []
@@ -669,26 +671,26 @@ def test_chat_failure_sends_fallback_and_does_not_call_remember() -> None:
 
 def test_send_failure_does_not_call_remember() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
-    chat_service.response = "short reply"
+    reply_service = FakeReplyService()
+    reply_service.response = "short reply"
     message = FakeMessage(text="hi", from_user=FakeUser())
     message.fail_on_answer_call = 0
 
     with pytest.raises(RuntimeError):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert memory_service.remember_calls == []
 
 
 def test_failure_on_second_chunk_after_first_succeeded_still_does_not_call_remember() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
-    chat_service.response = "x" * 5000  # splits into two chunks under the 4096 default limit
+    reply_service = FakeReplyService()
+    reply_service.response = "x" * 5000  # splits into two chunks under the 4096 default limit
     message = FakeMessage(text="hi", from_user=FakeUser())
     message.fail_on_answer_call = 1  # second chunk (0-indexed)
 
     with pytest.raises(RuntimeError):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert len(message.answer_calls) == 2
     assert memory_service.remember_calls == []
@@ -697,13 +699,13 @@ def test_failure_on_second_chunk_after_first_succeeded_still_does_not_call_remem
 def test_remember_failure_after_reply_sent_is_swallowed_safely() -> None:
     memory_service = FakeMemoryService()
     memory_service.raise_on_remember = VectorStorageError("upsert failed")
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
 
     # Must not raise -- the user already has their reply.
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
-    assert message.answer_calls == [chat_service.response]
+    assert message.answer_calls == [reply_service.response]
 
 
 def test_successful_memory_write_logged_with_safe_fields_only(
@@ -717,11 +719,11 @@ def test_successful_memory_write_logged_with_safe_fields_only(
         existing_id="mem-existing",
         similarity_score=0.87,
     )
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
 
     with caplog.at_level(logging.INFO):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert "action=skipped" in caplog.text
     assert "reason=semantic_duplicate" in caplog.text
@@ -731,13 +733,13 @@ def test_successful_memory_write_logged_with_safe_fields_only(
 
 def test_optional_user_fields_none_forwarded_safely() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(
         text="hi",
         from_user=FakeUser(username=None, first_name=None, last_name=None),
     )
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     call = memory_service.remember_calls[0]
     assert call["username"] is None
@@ -747,25 +749,25 @@ def test_optional_user_fields_none_forwarded_safely() -> None:
 
 def test_bot_reply_text_never_passed_to_remember() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
-    chat_service.response = "this is the generated reply"
+    reply_service = FakeReplyService()
+    reply_service.response = "this is the generated reply"
     message = FakeMessage(text="original user message", from_user=FakeUser())
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert memory_service.remember_calls[0]["text"] == "original user message"
-    assert chat_service.response not in memory_service.remember_calls[0]["text"]
+    assert reply_service.response not in memory_service.remember_calls[0]["text"]
 
 
 def test_user_ids_isolated_across_two_message_executions() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
 
     message_1 = FakeMessage(text="hi", from_user=FakeUser(id=1))
     message_2 = FakeMessage(text="hi", from_user=FakeUser(id=2))
 
-    asyncio.run(bot_module.handle_text_message(message_1, memory_service, chat_service))
-    asyncio.run(bot_module.handle_text_message(message_2, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message_1, memory_service, reply_service))
+    asyncio.run(bot_module.handle_text_message(message_2, memory_service, reply_service))
 
     assert memory_service.recall_calls[0]["user_id"] == 1
     assert memory_service.recall_calls[1]["user_id"] == 2
@@ -775,26 +777,26 @@ def test_user_ids_isolated_across_two_message_executions() -> None:
 
 def test_empty_text_does_not_call_external_services() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="   ", from_user=FakeUser())
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert memory_service.recall_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
     assert memory_service.remember_calls == []
     assert message.answer_calls == []
 
 
 def test_missing_from_user_does_not_call_external_services() -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=None)
 
-    asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+    asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert memory_service.recall_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
     assert memory_service.remember_calls == []
     assert message.answer_calls == []
 
@@ -836,7 +838,7 @@ def test_is_non_text_message_true_only_when_text_is_none() -> None:
     assert bot_module.is_non_text_message(message) is True
 
 
-def test_non_text_message_never_calls_memory_or_chat_services() -> None:
+def test_non_text_message_never_calls_memory_or_reply_services() -> None:
     message = FakeMessage(text=None, from_user=FakeUser())
 
     asyncio.run(bot_module.handle_non_text_message(message))
@@ -850,7 +852,7 @@ def test_non_text_message_never_calls_memory_or_chat_services() -> None:
 
 
 def test_dispatcher_start_reaches_only_start_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="/start")))
 
@@ -859,11 +861,11 @@ def test_dispatcher_start_reaches_only_start_handler() -> None:
     assert memory_service.remember_calls == []
     assert memory_service.get_memory_count_calls == []
     assert memory_service.forget_user_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_help_addressed_to_current_bot_reaches_only_help_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(
         dispatcher.feed_raw_update(
@@ -874,11 +876,11 @@ def test_dispatcher_help_addressed_to_current_bot_reaches_only_help_handler() ->
     assert session.sent_messages == [{"chat_id": 123, "text": _HELP_TEXT}]
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_help_addressed_to_another_bot_is_ignored() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(
         dispatcher.feed_raw_update(telegram_bot, _make_update(text="/help@some_other_bot"))
@@ -889,11 +891,11 @@ def test_dispatcher_help_addressed_to_another_bot_is_ignored() -> None:
     assert memory_service.remember_calls == []
     assert memory_service.get_memory_count_calls == []
     assert memory_service.forget_user_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_memory_reaches_only_memory_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
     memory_service.get_memory_count_response = 4
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="/memory")))
@@ -903,11 +905,11 @@ def test_dispatcher_memory_reaches_only_memory_handler() -> None:
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
     assert memory_service.forget_user_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_forget_me_reaches_only_forget_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="/forget_me")))
 
@@ -916,22 +918,22 @@ def test_dispatcher_forget_me_reaches_only_forget_handler() -> None:
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
     assert memory_service.get_memory_count_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_unknown_command_reaches_only_unknown_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="/unknown")))
 
     assert session.sent_messages == [{"chat_id": 123, "text": _UNKNOWN_COMMAND_TEXT}]
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_unknown_addressed_to_current_bot_reaches_only_unknown_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(
         dispatcher.feed_raw_update(
@@ -942,11 +944,11 @@ def test_dispatcher_unknown_addressed_to_current_bot_reaches_only_unknown_handle
     assert session.sent_messages == [{"chat_id": 123, "text": _UNKNOWN_COMMAND_TEXT}]
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_unknown_command_addressed_to_another_bot_is_ignored() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(
         dispatcher.feed_raw_update(telegram_bot, _make_update(text="/unknown@some_other_bot"))
@@ -955,12 +957,12 @@ def test_dispatcher_unknown_command_addressed_to_another_bot_is_ignored() -> Non
     assert session.sent_messages == []
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_ordinary_text_reaches_only_message_orchestration() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
-    chat_service.response = "a generated reply"
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
+    reply_service.response = "a generated reply"
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="hello there")))
 
@@ -969,44 +971,44 @@ def test_dispatcher_ordinary_text_reaches_only_message_orchestration() -> None:
         {"user_id": 123, "query": "hello there", "top_k": None}
     ]
     assert len(memory_service.remember_calls) == 1
-    assert chat_service.generate_reply_calls[0]["user_text"] == "hello there"
+    assert reply_service.generate_reply_calls[0]["user_text"] == "hello there"
 
 
 def test_dispatcher_non_text_reaches_only_unsupported_message_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(photo=True)))
 
     assert session.sent_messages == [{"chat_id": 123, "text": _NON_TEXT_TEXT}]
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def _assert_fully_absorbed(
     session: FakeTelegramSession,
     memory_service: FakeMemoryService,
-    chat_service: FakeChatService,
+    reply_service: FakeReplyService,
 ) -> None:
     assert session.sent_messages == []
     assert memory_service.recall_calls == []
     assert memory_service.remember_calls == []
     assert memory_service.get_memory_count_calls == []
     assert memory_service.forget_user_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 @pytest.mark.parametrize("malformed_text", ["/", "//help", "/foo-bar"])
 def test_dispatcher_malformed_slash_text_is_silently_absorbed(malformed_text: str) -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text=malformed_text)))
 
-    _assert_fully_absorbed(session, memory_service, chat_service)
+    _assert_fully_absorbed(session, memory_service, reply_service)
 
 
 def test_dispatcher_photo_update_still_reaches_only_non_text_handler() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(photo=True)))
 
@@ -1015,12 +1017,12 @@ def test_dispatcher_photo_update_still_reaches_only_non_text_handler() -> None:
     assert memory_service.remember_calls == []
     assert memory_service.get_memory_count_calls == []
     assert memory_service.forget_user_calls == []
-    assert chat_service.generate_reply_calls == []
+    assert reply_service.generate_reply_calls == []
 
 
 def test_dispatcher_ordinary_text_still_reaches_message_orchestration() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
-    chat_service.response = "a generated reply"
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
+    reply_service.response = "a generated reply"
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="hello there")))
 
@@ -1029,12 +1031,12 @@ def test_dispatcher_ordinary_text_still_reaches_message_orchestration() -> None:
         {"user_id": 123, "query": "hello there", "top_k": None}
     ]
     assert len(memory_service.remember_calls) == 1
-    assert chat_service.generate_reply_calls[0]["user_text"] == "hello there"
+    assert reply_service.generate_reply_calls[0]["user_text"] == "hello there"
 
 
 def test_dispatcher_slash_later_in_text_remains_ordinary_text() -> None:
-    telegram_bot, dispatcher, session, memory_service, chat_service = _build_harness()
-    chat_service.response = "a generated reply"
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
+    reply_service.response = "a generated reply"
     text = "расскажи про /help"
 
     asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text=text)))
@@ -1042,7 +1044,7 @@ def test_dispatcher_slash_later_in_text_remains_ordinary_text() -> None:
     assert session.sent_messages == [{"chat_id": 123, "text": "a generated reply"}]
     assert memory_service.recall_calls == [{"user_id": 123, "query": text, "top_k": None}]
     assert len(memory_service.remember_calls) == 1
-    assert chat_service.generate_reply_calls[0]["user_text"] == text
+    assert reply_service.generate_reply_calls[0]["user_text"] == text
 
 
 # ---------------------------------------------------------------------------
@@ -1179,11 +1181,11 @@ def test_recall_failure_logs_only_safe_event_and_error_type(
 ) -> None:
     memory_service = FakeMemoryService()
     memory_service.raise_on_recall = VectorQueryError("query failed with sensitive detail XYZ")
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
 
     with caplog.at_level(logging.WARNING):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert "event=recall_failed" in caplog.text
     assert "error_type=VectorQueryError" in caplog.text
@@ -1194,27 +1196,27 @@ def test_chat_generation_failure_logs_only_safe_event_and_error_type(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
-    chat_service.exception = ChatServiceError("chat completion request failed")
+    reply_service = FakeReplyService()
+    reply_service.exception = HaystackAgentServiceError("chat completion request failed")
     message = FakeMessage(text="hi", from_user=FakeUser())
 
     with caplog.at_level(logging.WARNING):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert "event=chat_generation_failed" in caplog.text
-    assert "error_type=ChatServiceError" in caplog.text
+    assert "error_type=HaystackAgentServiceError" in caplog.text
 
 
 def test_send_failure_logs_only_safe_event_and_error_type(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
     message.fail_on_answer_call = 0
 
     with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert "event=send_failed" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
@@ -1225,11 +1227,11 @@ def test_remember_failure_logs_only_safe_event_and_error_type(
 ) -> None:
     memory_service = FakeMemoryService()
     memory_service.raise_on_remember = VectorStorageError("upsert failed with secret XYZ")
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
 
     with caplog.at_level(logging.WARNING):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert "event=remember_failed" in caplog.text
     assert "error_type=VectorStorageError" in caplog.text
@@ -1270,8 +1272,8 @@ def test_logs_do_not_contain_secrets_or_raw_text(caplog: pytest.LogCaptureFixtur
     memory_service = FakeMemoryService()
     memory_service.raise_on_recall = VectorQueryError(f"query failed for key {FAKE_API_KEY}")
     memory_service.raise_on_remember = VectorStorageError("upsert failed: raw-secret-body")
-    chat_service = FakeChatService()
-    chat_service.response = "the generated reply text"
+    reply_service = FakeReplyService()
+    reply_service.response = "the generated reply text"
 
     secret_user_text = "my password is hunter2 and my name is Alice Wonderland"
     message = FakeMessage(
@@ -1282,7 +1284,7 @@ def test_logs_do_not_contain_secrets_or_raw_text(caplog: pytest.LogCaptureFixtur
     )
 
     with caplog.at_level(logging.DEBUG):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     log_text = caplog.text
     for leaked in (
@@ -1301,10 +1303,10 @@ def test_logs_do_not_contain_secrets_or_raw_text(caplog: pytest.LogCaptureFixtur
 
 def test_logs_never_contain_full_message_repr(caplog: pytest.LogCaptureFixture) -> None:
     memory_service = FakeMemoryService()
-    chat_service = FakeChatService()
+    reply_service = FakeReplyService()
     message = FakeMessage(text="hi", from_user=FakeUser())
 
     with caplog.at_level(logging.DEBUG):
-        asyncio.run(bot_module.handle_text_message(message, memory_service, chat_service))
+        asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
     assert "FAKE_MESSAGE_REPR_MARKER_DO_NOT_LOG" not in caplog.text
