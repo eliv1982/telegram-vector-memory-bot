@@ -1,31 +1,35 @@
-"""Unit tests for telegram_vector_memory_bot.haystack_agent.
+"""Модульные тесты для telegram_vector_memory_bot.haystack_agent.
 
-No real OpenAI client and no real HTTP call is ever made. The chat model is
-replaced by ``FakeChatGenerator``, a minimal Haystack ``@component`` that
-returns pre-scripted ``ChatMessage`` replies -- including tool-call messages
--- so a real ``haystack.components.agents.Agent`` can be exercised end to
-end (tool selection, tool invocation, final reply extraction) entirely
-offline. Real ``Tool`` objects from ``tools.py`` are used, wrapping fake
-underlying functions so no network I/O occurs.
+Ни один реальный клиент OpenAI и ни один реальный HTTP-вызов никогда не
+выполняются. Chat model заменена на ``FakeChatGenerator`` -- минимальный
+Haystack ``@component``, возвращающий заскриптованные ответы ``ChatMessage``
+-- включая tool-call сообщения -- так что реальный
+``haystack.components.agents.Agent`` можно прогнать целиком (выбор
+инструмента, вызов инструмента, извлечение итогового ответа) полностью
+offline. Используются настоящие объекты ``Tool`` из ``tools.py``,
+оборачивающие фейковые функции, так что сетевого I/O не происходит.
 
-The tool-selection tests use ``PromptRoutingFakeChatGenerator``, which reads
-the actual incoming user message text and picks its scripted tool call from
-that content -- with all five real tools registered on the same ``Agent`` at
-once. This is deliberately stronger than a generator that is merely
-pre-scripted to always return one fixed tool call regardless of the prompt
-(which would only prove the plumbing works, not that the right tool was
-"selected" for a given question): here, a different question really does
-route to a different tool call, and a wrong keyword match would call the
-wrong tool and fail the assertions on which fake tool function ran.
+Тесты выбора инструмента используют ``PromptRoutingFakeChatGenerator``,
+который читает реальный текст входящего сообщения пользователя и выбирает
+свой заскриптованный tool call на основании этого содержимого -- со всеми
+пятью реальными инструментами, зарегистрированными на одном и том же
+``Agent`` одновременно. Это намеренно строже, чем генератор, который просто
+заскриптован всегда возвращать один и тот же tool call независимо от
+промпта (это доказывало бы только то, что работает механика вызова, а не
+то, что для данного вопроса действительно был "выбран" нужный инструмент):
+здесь другой вопрос реально приводит к другому tool call, а неверное
+совпадение по ключевому слову вызвало бы не тот инструмент и провалило бы
+проверки того, какая фейковая функция инструмента сработала.
 
-Async methods are exercised via ``asyncio.run`` directly rather than a
-pytest-asyncio plugin, since none is a project dependency.
+Асинхронные методы прогоняются напрямую через ``asyncio.run``, а не через
+плагин pytest-asyncio, поскольку он не является зависимостью проекта.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +41,7 @@ from haystack.tools import Tool
 
 from telegram_vector_memory_bot.config import Settings
 from telegram_vector_memory_bot.haystack_agent import (
+    _SYSTEM_PROMPT,
     HaystackAgentService,
     HaystackAgentServiceError,
     build_context_message,
@@ -76,11 +81,12 @@ def _memory(
 
 @component
 class FakeChatGenerator:
-    """Minimal Haystack chat-generator component with pre-scripted replies.
+    """Минимальный компонент chat-generator Haystack с заскриптованными ответами.
 
-    Each call to ``run_async`` (or ``run``) returns the next scripted
-    ``{"replies": [...]}`` dict, letting a real ``Agent`` drive a full
-    tool-call round trip without any network access.
+    Каждый вызов ``run_async`` (или ``run``) возвращает следующий
+    заскриптованный словарь ``{"replies": [...]}``, позволяя реальному
+    ``Agent`` провести полный цикл tool-call без какого-либо сетевого
+    доступа.
     """
 
     def __init__(self, responses: list[dict[str, Any]]) -> None:
@@ -119,9 +125,10 @@ def _final_reply(text: str) -> dict[str, Any]:
     return {"replies": [ChatMessage.from_assistant(text)]}
 
 
-# (trigger substring, tool name, tool arguments, closing reply after the tool result)
-# Matched case-insensitively against the user's actual message text -- see
-# PromptRoutingFakeChatGenerator below.
+# (подстрока-триггер, имя инструмента, аргументы инструмента, закрывающий
+# ответ после результата инструмента). Сопоставляется без учёта регистра с
+# реальным текстом сообщения пользователя -- см. PromptRoutingFakeChatGenerator
+# ниже.
 _TOOL_SELECTION_TRIGGERS: list[tuple[str, str, dict[str, Any], str]] = [
     (
         "погода",
@@ -136,40 +143,41 @@ _TOOL_SELECTION_TRIGGERS: list[tuple[str, str, dict[str, Any], str]] = [
         "100 евро — это 110 долларов.",
     ),
     (
-        "про финляндию",
-        "get_country_info",
-        {"country": "Finland"},
-        "Финляндия — страна в Европе со столицей в Хельсинки.",
-    ),
-    (
-        "alan turing",
-        "get_wikipedia_summary",
-        {"topic": "Alan Turing"},
-        "Алан Тьюринг — английский математик и computer scientist.",
-    ),
-    (
         "который час",
         "get_current_time",
-        {"location": "Helsinki"},
-        "Сейчас в Хельсинки 21:15, понедельник.",
+        {"location": "Tokyo"},
+        "Сейчас в Токио 21:15, понедельник.",
+    ),
+    (
+        "праздники в дании",
+        "get_public_holidays",
+        {"country": "Дания", "year": 2026},
+        "1 января 2026 — Новый год в Дании.",
+    ),
+    (
+        "последняя версия haystack-ai",
+        "get_pypi_package_info",
+        {"package_name": "haystack-ai"},
+        "Последняя версия haystack-ai — 2.4.0.",
     ),
 ]
 
 
 @component
 class PromptRoutingFakeChatGenerator:
-    """Chooses a scripted tool call (or plain reply) from the user's own prompt text.
+    """Выбирает заскриптованный tool call (или обычный ответ) из текста промпта пользователя.
 
-    On its first call it inspects the latest user message and matches it
-    against ``_TOOL_SELECTION_TRIGGERS`` (case-insensitive substring match),
-    returning a tool-call reply for whichever trigger matched -- or a plain
-    "no tool for that" reply if none did. On the second call (after the
-    ``Agent``'s ``ToolInvoker`` has appended the tool result to the message
-    history) it returns the closing reply text for that same trigger. This
-    means the fake generator's behavior genuinely depends on what the user
-    asked, rather than an author-scripted assumption about what the LLM
-    would do -- so these tests actually exercise tool *selection*, not just
-    tool *invocation* plumbing.
+    При первом вызове проверяет последнее сообщение пользователя и
+    сопоставляет его с ``_TOOL_SELECTION_TRIGGERS`` (сравнение подстрок без
+    учёта регистра), возвращая tool-call ответ для того триггера, который
+    совпал -- или обычный ответ "нет подходящего инструмента", если ни один
+    не совпал. При втором вызове (после того как ``ToolInvoker`` агента
+    добавил результат инструмента в историю сообщений) возвращает закрывающий
+    текст ответа для того же триггера. Это значит, что поведение фейкового
+    генератора реально зависит от того, что спросил пользователь, а не от
+    авторского предположения о том, что сделала бы LLM -- так что эти тесты
+    действительно проверяют *выбор* инструмента, а не только механику его
+    *вызова*.
     """
 
     def __init__(self) -> None:
@@ -223,12 +231,13 @@ def _build_agent_with_fake_generator(
 
 
 def _build_agent_with_prompt_routing(tools: list[Tool]) -> Agent:
-    """Build an ``Agent`` whose fake LLM picks its tool call from the real prompt text.
+    """Построить ``Agent``, чей фейковый LLM выбирает tool call из реального текста промпта.
 
-    Unlike ``_build_agent_with_fake_generator``, *tools* is meant to hold
-    several (typically all five) real tools at once, so a passing test shows
-    the right one was chosen among genuine alternatives -- not just that the
-    only tool available happened to be invoked.
+    В отличие от ``_build_agent_with_fake_generator``, *tools* здесь обычно
+    содержит сразу несколько (как правило, все пять) реальных инструментов,
+    так что прошедший тест показывает, что среди настоящих альтернатив был
+    выбран именно нужный -- а не просто что был вызван единственный
+    доступный инструмент.
     """
     return Agent(
         chat_generator=PromptRoutingFakeChatGenerator(),
@@ -247,7 +256,7 @@ def test_build_context_message_serializes_only_text() -> None:
 
     message = build_context_message(memories)
 
-    assert "untrusted" in message.lower()
+    assert "недоверенный" in message.lower()
     parsed = json.loads(message.split("\n", 1)[1])
     assert parsed == ["first", "second"]
 
@@ -260,7 +269,40 @@ def test_build_context_message_empty_list_is_empty_json_array() -> None:
 
 
 # ---------------------------------------------------------------------------
-# generate_reply -- input validation
+# _SYSTEM_PROMPT
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_is_in_russian() -> None:
+    assert re.search(r"[Ѐ-ӿ]", _SYSTEM_PROMPT)
+
+
+def test_system_prompt_defaults_to_russian_but_allows_user_language() -> None:
+    lowered = _SYSTEM_PROMPT.lower()
+    assert "по умолчанию отвечай на русском" in lowered
+    assert "написано на другом" in lowered and "можно ответить на этом языке" in lowered
+
+
+def test_system_prompt_treats_retrieved_context_as_untrusted() -> None:
+    lowered = _SYSTEM_PROMPT.lower()
+    assert "недоверенные" in lowered
+    assert "не инструкции" in lowered
+    assert "никогда не" in lowered and "выполняй" in lowered
+
+
+def test_system_prompt_lists_all_five_tools() -> None:
+    for tool_name in (
+        "get_current_weather",
+        "convert_currency",
+        "get_current_time",
+        "get_public_holidays",
+        "get_pypi_package_info",
+    ):
+        assert tool_name in _SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# generate_reply -- проверка входных данных
 # ---------------------------------------------------------------------------
 
 
@@ -277,7 +319,7 @@ def test_empty_user_text_rejected_without_agent_call(user_text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# generate_reply -- plain (no tool call) success
+# generate_reply -- обычный успех (без tool call)
 # ---------------------------------------------------------------------------
 
 
@@ -307,62 +349,67 @@ def test_generate_reply_passes_context_and_user_message_to_agent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# generate_reply -- tool selection
+# generate_reply -- выбор инструмента
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def _all_five_tools_with_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
-    """Register all five real tools on one agent, each backed by a call-recording fake.
+    """Зарегистрировать все пять реальных инструментов на одном агенте, каждый поверх фейка.
 
-    Returns a dict of per-tool call logs (keyed by tool name) so a test can
-    assert that exactly one tool's log was populated -- proving the fake LLM
-    actually *selected* that tool among five real alternatives, rather than
-    merely invoking the one tool it was given.
+    Возвращает словарь журналов вызовов по каждому инструменту (по имени
+    инструмента), чтобы тест мог проверить, что заполнен журнал ровно
+    одного инструмента -- доказывая, что фейковый LLM действительно *выбрал*
+    этот инструмент среди пяти реальных альтернатив, а не просто вызвал
+    единственный данный ему инструмент.
     """
     from telegram_vector_memory_bot import tools as tools_module
 
     calls: dict[str, list[Any]] = {
         "get_current_weather": [],
         "convert_currency": [],
-        "get_country_info": [],
-        "get_wikipedia_summary": [],
         "get_current_time": [],
+        "get_public_holidays": [],
+        "get_pypi_package_info": [],
     }
 
     def fake_weather(city: str) -> str:
         calls["get_current_weather"].append({"city": city})
-        return "Current weather in Helsinki: temperature 5.0°C, wind speed 10.0 km/h."
+        return "Текущая погода в Хельсинки: температура 5.0°C, скорость ветра 10.0 км/ч."
 
     def fake_convert(amount: float, from_currency: str, to_currency: str) -> str:
         calls["convert_currency"].append(
             {"amount": amount, "from_currency": from_currency, "to_currency": to_currency}
         )
-        return "100 EUR = 110.00 USD (rate: 1 EUR = 1.1 USD)."
-
-    def fake_country_info(country: str) -> str:
-        calls["get_country_info"].append({"country": country})
-        return (
-            "Finland: capital Helsinki, region Europe, population 5540720, "
-            "currencies: Euro (EUR)."
-        )
-
-    def fake_wikipedia_summary(topic: str, language: str = "en") -> str:
-        calls["get_wikipedia_summary"].append({"topic": topic})
-        return (
-            "Alan Turing: English mathematician and computer scientist. "
-            "(source: https://en.wikipedia.org/wiki/Alan_Turing)"
-        )
+        return "100 EUR = 110.00 USD (курс: 1 EUR = 1.1 USD)."
 
     def fake_get_current_time(location: str) -> str:
         calls["get_current_time"].append({"location": location})
-        return "Current time for 'Helsinki' (Europe/Helsinki): 2026-07-06 21:15:00 EEST, Monday."
+        return (
+            "Текущее время для 'Tokyo' (Asia/Tokyo): 2026-07-06 21:15:00 JST, понедельник."
+        )
+
+    def fake_public_holidays(country: str, year: int | None = None) -> str:
+        calls["get_public_holidays"].append({"country": country, "year": year})
+        return "Праздники в DK (2026): 2026-01-01 — Nytårsdag (New Year's Day)."
+
+    def fake_pypi_package_info(package_name: str) -> str:
+        calls["get_pypi_package_info"].append({"package_name": package_name})
+        return (
+            "Пакет haystack-ai: последняя версия 2.4.0. "
+            "Описание: LLM orchestration framework. "
+            "Требуемая версия Python: >=3.9. "
+            "Лицензия: Apache-2.0. "
+            "Ссылка: https://haystack.deepset.ai/."
+        )
 
     monkeypatch.setattr(tools_module.weather_tool, "function", fake_weather)
     monkeypatch.setattr(tools_module.currency_tool, "function", fake_convert)
-    monkeypatch.setattr(tools_module.country_info_tool, "function", fake_country_info)
-    monkeypatch.setattr(tools_module.wikipedia_summary_tool, "function", fake_wikipedia_summary)
     monkeypatch.setattr(tools_module.time_tool, "function", fake_get_current_time)
+    monkeypatch.setattr(tools_module.public_holidays_tool, "function", fake_public_holidays)
+    monkeypatch.setattr(
+        tools_module.pypi_package_info_tool, "function", fake_pypi_package_info
+    )
 
     return calls
 
@@ -373,9 +420,9 @@ def _all_five_tools() -> list[Tool]:
     return [
         tools_module.weather_tool,
         tools_module.currency_tool,
-        tools_module.country_info_tool,
-        tools_module.wikipedia_summary_tool,
         tools_module.time_tool,
+        tools_module.public_holidays_tool,
+        tools_module.pypi_package_info_tool,
     ]
 
 
@@ -419,34 +466,6 @@ def test_currency_tool_is_selected_for_currency_question(
     assert "110" in reply
 
 
-def test_country_info_tool_is_selected_for_country_question(
-    _all_five_tools_with_fakes: dict[str, list[Any]],
-) -> None:
-    agent = _build_agent_with_prompt_routing(_all_five_tools())
-    service = HaystackAgentService(settings=_build_settings(), agent=agent)
-
-    reply = asyncio.run(
-        service.generate_reply(user_text="Расскажи кратко про Финляндию", memories=[])
-    )
-
-    _assert_only_this_tool_was_called(_all_five_tools_with_fakes, "get_country_info")
-    assert _all_five_tools_with_fakes["get_country_info"] == [{"country": "Finland"}]
-    assert "Хельсинки" in reply
-
-
-def test_wikipedia_summary_tool_is_selected_for_who_is_question(
-    _all_five_tools_with_fakes: dict[str, list[Any]],
-) -> None:
-    agent = _build_agent_with_prompt_routing(_all_five_tools())
-    service = HaystackAgentService(settings=_build_settings(), agent=agent)
-
-    reply = asyncio.run(service.generate_reply(user_text="Кто такой Alan Turing?", memories=[]))
-
-    _assert_only_this_tool_was_called(_all_five_tools_with_fakes, "get_wikipedia_summary")
-    assert _all_five_tools_with_fakes["get_wikipedia_summary"] == [{"topic": "Alan Turing"}]
-    assert "Тьюринг" in reply
-
-
 def test_time_tool_is_selected_for_what_time_is_it_question(
     _all_five_tools_with_fakes: dict[str, list[Any]],
 ) -> None:
@@ -454,12 +473,46 @@ def test_time_tool_is_selected_for_what_time_is_it_question(
     service = HaystackAgentService(settings=_build_settings(), agent=agent)
 
     reply = asyncio.run(
-        service.generate_reply(user_text="Который час в Хельсинки?", memories=[])
+        service.generate_reply(user_text="Который час в Токио?", memories=[])
     )
 
     _assert_only_this_tool_was_called(_all_five_tools_with_fakes, "get_current_time")
-    assert _all_five_tools_with_fakes["get_current_time"] == [{"location": "Helsinki"}]
-    assert "Хельсинки" in reply
+    assert _all_five_tools_with_fakes["get_current_time"] == [{"location": "Tokyo"}]
+    assert "Токио" in reply
+
+
+def test_public_holidays_tool_is_selected_for_holiday_question(
+    _all_five_tools_with_fakes: dict[str, list[Any]],
+) -> None:
+    agent = _build_agent_with_prompt_routing(_all_five_tools())
+    service = HaystackAgentService(settings=_build_settings(), agent=agent)
+
+    reply = asyncio.run(
+        service.generate_reply(
+            user_text="Какие праздники в Дании в 2026 году?", memories=[]
+        )
+    )
+
+    _assert_only_this_tool_was_called(_all_five_tools_with_fakes, "get_public_holidays")
+    assert _all_five_tools_with_fakes["get_public_holidays"] == [{"country": "Дания", "year": 2026}]
+    assert "Новый год" in reply
+
+
+def test_pypi_tool_is_selected_for_package_version_question(
+    _all_five_tools_with_fakes: dict[str, list[Any]],
+) -> None:
+    agent = _build_agent_with_prompt_routing(_all_five_tools())
+    service = HaystackAgentService(settings=_build_settings(), agent=agent)
+
+    reply = asyncio.run(
+        service.generate_reply(user_text="Какая последняя версия haystack-ai?", memories=[])
+    )
+
+    _assert_only_this_tool_was_called(_all_five_tools_with_fakes, "get_pypi_package_info")
+    assert _all_five_tools_with_fakes["get_pypi_package_info"] == [
+        {"package_name": "haystack-ai"}
+    ]
+    assert "haystack-ai" in reply
 
 
 def test_no_tool_is_selected_for_an_unrelated_question(
@@ -477,7 +530,7 @@ def test_no_tool_is_selected_for_an_unrelated_question(
 
 
 # ---------------------------------------------------------------------------
-# generate_reply -- error handling
+# generate_reply -- обработка ошибок
 # ---------------------------------------------------------------------------
 
 
@@ -542,7 +595,7 @@ def test_error_message_does_not_expose_secrets_or_prompt_data() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Construction
+# Конструирование
 # ---------------------------------------------------------------------------
 
 
@@ -565,8 +618,8 @@ def test_injected_agent_is_used_instead_of_building_one() -> None:
 
 
 class _RecordingChatGenerator:
-    """Records construction kwargs; exposes a bare-minimum ``run`` so a real
-    ``Agent`` accepts it as a valid chat generator without making any call."""
+    """Записывает kwargs конструктора; выставляет минимальный ``run``, чтобы
+    реальный ``Agent`` принял его как валидный chat generator без вызовов."""
 
     last_kwargs: dict[str, Any] | None = None
 
@@ -605,8 +658,8 @@ def test_chat_generator_constructed_without_base_url(monkeypatch: pytest.MonkeyP
 def test_non_text_last_message_rejected() -> None:
     class NonTextReplyAgent:
         async def run_async(self, *, messages: list[ChatMessage]) -> dict[str, Any]:
-            # A message carrying only a tool call, no text content -- exercises
-            # the branch where the agent's last message is not plain text.
+            # Сообщение, несущее только tool call, без текстового содержимого --
+            # проверяет ветку, где последнее сообщение агента не обычный текст.
             last_message = ChatMessage.from_assistant(
                 text=None,
                 tool_calls=[ToolCall(id="call_1", tool_name="noop", arguments={})],

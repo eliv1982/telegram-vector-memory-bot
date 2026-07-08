@@ -1,18 +1,21 @@
-"""Unit tests for telegram_vector_memory_bot.tools.
+"""Модульные тесты для telegram_vector_memory_bot.tools.
 
-All tests run against a fake httpx.Client -- no real network call is ever
-made. Each tool function is exercised directly (success, not-found, and
-transport-failure paths), and each Tool wrapper is checked for having the
-expected name/function/required-parameters wiring the agent depends on.
+Все тесты работают против фейкового httpx.Client -- ни один реальный
+сетевой вызов никогда не выполняется. Каждая функция-инструмент проверяется
+напрямую (успех, не найдено, сбой транспорта), а каждая обёртка Tool
+проверяется на наличие ожидаемого name/function/required-parameters, от
+которых зависит агент.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
 import pytest
+from haystack.tools import Tool
 
 from telegram_vector_memory_bot import tools
 
@@ -22,9 +25,9 @@ _UNSET: Any = object()
 class FakeResponse:
     def __init__(self, *, status_code: int = 200, json_data: Any = _UNSET) -> None:
         self.status_code = status_code
-        # A real sentinel (not just `None`) distinguishes "no json_data passed
-        # -> default to {}" from "the test wants .json() to literally return
-        # None/a list/a string", which malformed-payload tests need below.
+        # Настоящий sentinel (а не просто `None`) отличает "json_data не
+        # передан -> по умолчанию {}" от "тест хочет, чтобы .json() буквально
+        # вернул None/список/строку", что нужно тестам malformed-payload ниже.
         self._json_data = {} if json_data is _UNSET else json_data
 
     def raise_for_status(self) -> None:
@@ -38,7 +41,7 @@ class FakeResponse:
 
 
 class FakeHttpxClient:
-    """Fake stand-in for httpx.Client -- returns scripted responses, no network I/O."""
+    """Фейковая замена httpx.Client -- возвращает заскриптованные ответы, без сетевого I/O."""
 
     def __init__(
         self,
@@ -49,13 +52,14 @@ class FakeHttpxClient:
         self._responses = iter(responses or [])
         self._exception = exception
         self.calls: list[dict[str, Any]] = []
-        # Populated by _install_fake_client with whatever kwargs the tool
-        # under test passed to httpx.Client(...), so tests can assert on
-        # e.g. timeout/follow_redirects without touching real network code.
+        # Заполняется _install_fake_client теми же kwargs, что тестируемый
+        # инструмент передал в httpx.Client(...), так что тесты могут
+        # проверять, например, timeout/follow_redirects без обращения к
+        # реальному сетевому коду.
         self.client_kwargs: dict[str, Any] = {}
 
     def get(self, url: str, params: dict[str, Any] | None = None, **kwargs: Any) -> FakeResponse:
-        self.calls.append({"url": url, "params": params})
+        self.calls.append({"url": url, "params": params, "kwargs": kwargs})
         if self._exception is not None:
             raise self._exception
         return next(self._responses)
@@ -110,6 +114,57 @@ def test_get_current_weather_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake_client.calls[1]["url"] == tools._FORECAST_URL
 
 
+def test_get_current_weather_normalizes_russian_helsinki_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data={
+                    "results": [
+                        {
+                            "name": "Helsinki",
+                            "country": "Finland",
+                            "latitude": 60.17,
+                            "longitude": 24.94,
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(json_data={"current_weather": {"temperature": 5.0, "windspeed": 10.0}}),
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_current_weather("Хельсинки")
+
+    assert "Helsinki" in result
+    assert "Finland" in result
+    assert fake_client.calls[0]["params"]["name"] == "Helsinki"
+
+
+@pytest.mark.parametrize(
+    ("russian_form", "expected_english"),
+    [
+        ("Хельсинки", "Helsinki"),
+        ("Москва", "Moscow"),
+        ("Лондон", "London"),
+        ("Токио", "Tokyo"),
+        ("Берлин", "Berlin"),
+        ("Париж", "Paris"),
+        ("Нью-Йорк", "New York"),
+    ],
+)
+def test_normalize_weather_city_maps_all_documented_russian_aliases(
+    russian_form: str, expected_english: str
+) -> None:
+    assert tools._normalize_weather_city(russian_form) == expected_english
+
+
+def test_normalize_weather_city_leaves_english_names_unchanged() -> None:
+    assert tools._normalize_weather_city("Helsinki") == "Helsinki"
+
+
 def test_get_current_weather_uses_expected_client_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_client = FakeHttpxClient(
         [
@@ -126,6 +181,7 @@ def test_get_current_weather_uses_expected_client_timeout(monkeypatch: pytest.Mo
     tools.get_current_weather("Helsinki")
 
     assert fake_client.client_kwargs["timeout"] == 10.0
+    assert fake_client.client_kwargs["follow_redirects"] is True
 
 
 def test_get_current_weather_city_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,7 +190,7 @@ def test_get_current_weather_city_not_found(monkeypatch: pytest.MonkeyPatch) -> 
 
     result = tools.get_current_weather("Nonexistentville")
 
-    assert "not found" in result.lower()
+    assert "не найден" in result.lower()
 
 
 def test_get_current_weather_blank_city_rejected_without_http_call(
@@ -147,7 +203,7 @@ def test_get_current_weather_blank_city_rejected_without_http_call(
 
     result = tools.get_current_weather("   ")
 
-    assert "must not be empty" in result.lower()
+    assert "не может быть пустым" in result.lower()
 
 
 def test_get_current_weather_transport_failure_returns_safe_fallback(
@@ -159,7 +215,7 @@ def test_get_current_weather_transport_failure_returns_safe_fallback(
     with caplog.at_level(logging.WARNING):
         result = tools.get_current_weather("Helsinki")
 
-    assert "unavailable" in result.lower()
+    assert "недоступен" in result.lower()
     assert "event=tool_call_failed" in caplog.text
     assert "tool=get_current_weather" in caplog.text
 
@@ -174,7 +230,7 @@ def test_get_current_weather_missing_coordinates_returns_safe_fallback(
 
     result = tools.get_current_weather("Helsinki")
 
-    assert "no coordinates" in result.lower()
+    assert "координаты" in result.lower()
 
 
 def test_get_current_weather_missing_current_weather_returns_safe_fallback(
@@ -192,7 +248,7 @@ def test_get_current_weather_missing_current_weather_returns_safe_fallback(
 
     result = tools.get_current_weather("Helsinki")
 
-    assert "no current weather data" in result.lower()
+    assert "нет данных о текущей погоде" in result.lower()
 
 
 def test_get_current_weather_malformed_json_returns_safe_fallback(
@@ -207,7 +263,7 @@ def test_get_current_weather_malformed_json_returns_safe_fallback(
 
     result = tools.get_current_weather("Helsinki")
 
-    assert "unreadable" in result.lower()
+    assert "нечитаемый" in result.lower()
 
 
 @pytest.mark.parametrize("malformed_geo_data", [[], "not-an-object", None, 42])
@@ -220,7 +276,7 @@ def test_get_current_weather_non_dict_geocoding_response_returns_safe_fallback(
     with caplog.at_level(logging.WARNING):
         result = tools.get_current_weather("Helsinki")
 
-    assert "unreadable" in result.lower()
+    assert "нечитаемый" in result.lower()
     assert "event=tool_call_failed" in caplog.text
     assert "tool=get_current_weather" in caplog.text
 
@@ -234,7 +290,7 @@ def test_get_current_weather_non_dict_result_entry_returns_safe_fallback(
 
     result = tools.get_current_weather("Helsinki")
 
-    assert "unreadable" in result.lower()
+    assert "нечитаемый" in result.lower()
 
 
 @pytest.mark.parametrize("malformed_forecast_data", [[], "not-an-object", None])
@@ -255,7 +311,7 @@ def test_get_current_weather_non_dict_forecast_response_returns_safe_fallback(
 
     result = tools.get_current_weather("Helsinki")
 
-    assert "unreadable" in result.lower()
+    assert "нечитаемый" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +342,7 @@ def test_convert_currency_uses_expected_client_timeout(monkeypatch: pytest.Monke
     tools.convert_currency(100, "EUR", "USD")
 
     assert fake_client.client_kwargs["timeout"] == 10.0
+    assert fake_client.client_kwargs["follow_redirects"] is True
 
 
 def test_convert_currency_blank_target_currency_rejected_without_http_call(
@@ -298,7 +355,7 @@ def test_convert_currency_blank_target_currency_rejected_without_http_call(
 
     result = tools.convert_currency(100, "EUR", "")
 
-    assert "must not be empty" in result.lower()
+    assert "не может быть пустым" in result.lower()
 
 
 def test_convert_currency_non_numeric_amount_rejected_without_http_call(
@@ -311,7 +368,7 @@ def test_convert_currency_non_numeric_amount_rejected_without_http_call(
 
     result = tools.convert_currency(True, "EUR", "USD")  # bool must be rejected, not treated as 1
 
-    assert "amount must be numeric" in result.lower()
+    assert "должна быть числом" in result.lower()
 
 
 def test_convert_currency_result_not_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,7 +377,7 @@ def test_convert_currency_result_not_success(monkeypatch: pytest.MonkeyPatch) ->
 
     result = tools.convert_currency(100, "EUR", "USD")
 
-    assert "no rates available" in result.lower()
+    assert "нет курсов" in result.lower()
 
 
 def test_convert_currency_malformed_rate_type(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -331,7 +388,7 @@ def test_convert_currency_malformed_rate_type(monkeypatch: pytest.MonkeyPatch) -
 
     result = tools.convert_currency(100, "EUR", "USD")
 
-    assert "malformed rate" in result.lower()
+    assert "некорректный курс" in result.lower()
 
 
 def test_convert_currency_malformed_json_returns_safe_fallback(
@@ -346,7 +403,7 @@ def test_convert_currency_malformed_json_returns_safe_fallback(
 
     result = tools.convert_currency(100, "EUR", "USD")
 
-    assert "unreadable" in result.lower()
+    assert "нечитаемый" in result.lower()
 
 
 @pytest.mark.parametrize("malformed_data", [[], "not-an-object", None, 42])
@@ -359,7 +416,7 @@ def test_convert_currency_non_dict_response_returns_safe_fallback(
     with caplog.at_level(logging.WARNING):
         result = tools.convert_currency(100, "EUR", "USD")
 
-    assert "unreadable" in result.lower()
+    assert "нечитаемый" in result.lower()
     assert "event=tool_call_failed" in caplog.text
     assert "tool=convert_currency" in caplog.text
 
@@ -370,7 +427,7 @@ def test_convert_currency_unknown_target_rate(monkeypatch: pytest.MonkeyPatch) -
 
     result = tools.convert_currency(100, "EUR", "XYZ")
 
-    assert "no rate available" in result.lower()
+    assert "нет курса" in result.lower()
 
 
 def test_convert_currency_blank_currency_rejected_without_http_call(
@@ -383,7 +440,7 @@ def test_convert_currency_blank_currency_rejected_without_http_call(
 
     result = tools.convert_currency(100, "", "USD")
 
-    assert "must not be empty" in result.lower()
+    assert "не может быть пустым" in result.lower()
 
 
 def test_convert_currency_transport_failure_returns_safe_fallback(
@@ -395,247 +452,345 @@ def test_convert_currency_transport_failure_returns_safe_fallback(
     with caplog.at_level(logging.WARNING):
         result = tools.convert_currency(100, "EUR", "USD")
 
-    assert "unavailable" in result.lower()
+    assert "недоступен" in result.lower()
     assert "event=tool_call_failed" in caplog.text
     assert "tool=convert_currency" in caplog.text
 
 
 # ---------------------------------------------------------------------------
-# get_country_info
+# get_public_holidays
 # ---------------------------------------------------------------------------
 
 
-def test_get_country_info_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_public_holidays_success(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_client = FakeHttpxClient(
         [
             FakeResponse(
                 json_data=[
                     {
-                        "name": {"common": "Finland"},
-                        "capital": ["Helsinki"],
-                        "currencies": {"EUR": {"name": "Euro"}},
-                        "languages": {"fin": "Finnish", "swe": "Swedish"},
-                        "population": 5540720,
-                        "region": "Europe",
-                    }
+                        "date": "2026-01-01",
+                        "localName": "Uudenvuodenpäivä",
+                        "name": "New Year's Day",
+                    },
+                    {
+                        "date": "2026-12-06",
+                        "localName": "Itsenäisyyspäivä",
+                        "name": "Independence Day",
+                    },
                 ]
             )
         ]
     )
     _install_fake_client(monkeypatch, fake_client)
 
-    result = tools.get_country_info("Finland")
+    result = tools.get_public_holidays("FI", year=2026)
 
-    assert "Finland" in result
-    assert "Helsinki" in result
-    assert "Euro" in result
-    assert "Finnish" in result
-    assert "5540720" in result
-    assert "Europe" in result
-
-
-def test_get_country_info_uses_expected_client_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_client = FakeHttpxClient([FakeResponse(json_data=[{"name": {"common": "Finland"}}])])
-    _install_fake_client(monkeypatch, fake_client)
-
-    tools.get_country_info("Finland")
-
-    assert fake_client.client_kwargs["timeout"] == 10.0
+    assert "2026-01-01" in result
+    assert "Uudenvuodenpäivä" in result
+    assert "New Year's Day" in result
+    assert "2026-12-06" in result
+    assert "Independence Day" in result
+    assert fake_client.calls[0]["url"] == tools._NAGER_HOLIDAYS_URL.format(
+        year=2026, country_code="FI"
+    )
 
 
-def test_get_country_info_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_client = FakeHttpxClient([FakeResponse(status_code=404)])
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_country_info("Nowhereland")
-
-    assert "no country found" in result.lower()
-
-
-def test_get_country_info_empty_result_list(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_client = FakeHttpxClient([FakeResponse(json_data=[])])
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_country_info("Nowhereland")
-
-    assert "no country found" in result.lower()
-
-
-@pytest.mark.parametrize("malformed_top_level", [{"not": "a list"}, "not-a-list", None, 42])
-def test_get_country_info_non_list_top_level_returns_safe_fallback(
-    monkeypatch: pytest.MonkeyPatch, malformed_top_level: Any
-) -> None:
-    fake_client = FakeHttpxClient([FakeResponse(json_data=malformed_top_level)])
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_country_info("Nowhereland")
-
-    assert "no country found" in result.lower()
-
-
-@pytest.mark.parametrize("malformed_entry", ["not-an-object", 42, ["nested-list"], None])
-def test_get_country_info_non_dict_entry_returns_safe_fallback(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, malformed_entry: Any
-) -> None:
-    fake_client = FakeHttpxClient([FakeResponse(json_data=[malformed_entry])])
-    _install_fake_client(monkeypatch, fake_client)
-
-    with caplog.at_level(logging.WARNING):
-        result = tools.get_country_info("Nowhereland")
-
-    assert "unreadable" in result.lower()
-    assert "event=tool_call_failed" in caplog.text
-    assert "tool=get_country_info" in caplog.text
-
-
-def test_get_country_info_currency_entry_with_wrong_shape_does_not_raise(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_get_public_holidays_uses_expected_client_options(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_client = FakeHttpxClient(
-        [
-            FakeResponse(
-                json_data=[
-                    {
-                        "name": {"common": "Finland"},
-                        "capital": ["Helsinki"],
-                        # "currencies" values are expected to be objects like
-                        # {"name": "Euro"} -- a bare string is a malformed shape.
-                        "currencies": {"EUR": "not-an-object"},
-                        "languages": {"fin": "Finnish"},
-                        "population": 5540720,
-                        "region": "Europe",
-                    }
-                ]
-            )
-        ]
+        [FakeResponse(json_data=[{"date": "2026-01-01", "localName": "X", "name": "X"}])]
     )
     _install_fake_client(monkeypatch, fake_client)
 
-    result = tools.get_country_info("Finland")
-
-    assert "Finland" in result
-    assert "EUR" in result
-
-
-def test_get_country_info_language_entry_with_wrong_shape_does_not_raise(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_client = FakeHttpxClient(
-        [
-            FakeResponse(
-                json_data=[
-                    {
-                        "name": {"common": "Finland"},
-                        "capital": ["Helsinki"],
-                        "currencies": {"EUR": {"name": "Euro"}},
-                        # language values are expected to be strings -- a
-                        # nested object/number here is a malformed shape.
-                        "languages": {"fin": 12345},
-                        "population": 5540720,
-                        "region": "Europe",
-                    }
-                ]
-            )
-        ]
-    )
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_country_info("Finland")
-
-    assert "Finland" in result
-    assert "12345" in result
-
-
-def test_get_country_info_malformed_json_returns_safe_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class BrokenResponse(FakeResponse):
-        def json(self) -> Any:
-            raise ValueError("not json")
-
-    fake_client = FakeHttpxClient([BrokenResponse()])
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_country_info("Finland")
-
-    assert "unreadable" in result.lower()
-
-
-def test_get_country_info_blank_rejected_without_http_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _explode(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("must not perform HTTP calls for blank input")
-
-    monkeypatch.setattr(tools.httpx, "Client", _explode)
-
-    result = tools.get_country_info("   ")
-
-    assert "must not be empty" in result.lower()
-
-
-def test_get_country_info_transport_failure_returns_safe_fallback(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    fake_client = FakeHttpxClient(exception=httpx.ReadTimeout("timed out"))
-    _install_fake_client(monkeypatch, fake_client)
-
-    with caplog.at_level(logging.WARNING):
-        result = tools.get_country_info("Finland")
-
-    assert "unavailable" in result.lower()
-    assert "event=tool_call_failed" in caplog.text
-    assert "tool=get_country_info" in caplog.text
-
-
-# ---------------------------------------------------------------------------
-# get_wikipedia_summary
-# ---------------------------------------------------------------------------
-
-
-def test_get_wikipedia_summary_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_client = FakeHttpxClient(
-        [
-            FakeResponse(
-                json_data={
-                    "title": "Alan Turing",
-                    "extract": "English mathematician and computer scientist.",
-                    "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Alan_Turing"}},
-                }
-            )
-        ]
-    )
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_wikipedia_summary("Alan Turing")
-
-    assert "Alan Turing" in result
-    assert "mathematician" in result
-    assert "https://en.wikipedia.org/wiki/Alan_Turing" in result
-
-
-def test_get_wikipedia_summary_uses_expected_client_options(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_client = FakeHttpxClient(
-        [FakeResponse(json_data={"title": "Alan Turing", "extract": "A summary."})]
-    )
-    _install_fake_client(monkeypatch, fake_client)
-
-    tools.get_wikipedia_summary("Alan Turing")
+    tools.get_public_holidays("FI", year=2026)
 
     assert fake_client.client_kwargs["timeout"] == 10.0
     assert fake_client.client_kwargs["follow_redirects"] is True
 
 
-def test_get_wikipedia_summary_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_public_holidays_uses_v4_denmark_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data=[
+                    {
+                        "date": "2026-01-01",
+                        "localName": "Nytårsdag",
+                        "name": "New Year's Day",
+                    }
+                ]
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    tools.get_public_holidays("Дания", year=2026)
+
+    assert (
+        fake_client.calls[0]["url"] == "https://date.nager.at/api/v4/Holidays/DK/2026"
+    )
+
+
+def test_get_public_holidays_uses_v4_sweden_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data=[
+                    {
+                        "date": "2026-01-01",
+                        "localName": "Nyårsdagen",
+                        "name": "New Year's Day",
+                    }
+                ]
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    tools.get_public_holidays("Швеция", year=2026)
+
+    assert (
+        fake_client.calls[0]["url"] == "https://date.nager.at/api/v4/Holidays/SE/2026"
+    )
+
+
+def test_get_public_holidays_omits_duplicate_name_when_same_as_local_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = FakeHttpxClient(
+        [FakeResponse(json_data=[{"date": "2026-01-01", "localName": "X", "name": "X"}])]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("FI", year=2026)
+
+    assert result.count("X") == 1
+
+
+def test_get_public_holidays_uses_current_year_when_year_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    fake_client = FakeHttpxClient(
+        [FakeResponse(json_data=[{"date": "2026-01-01", "localName": "X", "name": "X"}])]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    current_year = datetime.now(UTC).year
+    result = tools.get_public_holidays("FI")
+
+    assert str(current_year) in result
+    assert fake_client.calls[0]["url"] == tools._NAGER_HOLIDAYS_URL.format(
+        year=current_year, country_code="FI"
+    )
+
+
+@pytest.mark.parametrize(
+    ("country_name", "expected_code"),
+    [
+        ("Швеция", "SE"),
+        ("Sweden", "SE"),
+        ("se", "SE"),
+        ("Дания", "DK"),
+        ("Denmark", "DK"),
+        ("Финляндия", "FI"),
+        ("Finland", "FI"),
+        ("Германия", "DE"),
+        ("Germany", "DE"),
+        ("Франция", "FR"),
+        ("France", "FR"),
+        ("Япония", "JP"),
+        ("Japan", "JP"),
+        ("США", "US"),
+        ("Америка", "US"),
+        ("United States", "US"),
+        ("Великобритания", "GB"),
+        ("Англия", "GB"),
+        ("United Kingdom", "GB"),
+        ("Южная Корея", "KR"),
+        ("Северная Корея", "KP"),
+        ("Чехия", "CZ"),
+    ],
+)
+def test_normalize_country_code_resolves_supported_names_and_codes(
+    country_name: str, expected_code: str
+) -> None:
+    assert tools._normalize_country_code(country_name) == expected_code
+
+
+def test_normalize_country_code_leaves_iso_code_unchanged() -> None:
+    assert tools._normalize_country_code("FI") == "FI"
+
+
+def test_get_public_holidays_normalizes_russian_country_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = FakeHttpxClient(
+        [FakeResponse(json_data=[{"date": "2026-01-01", "localName": "X", "name": "X"}])]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("Финляндия", year=2026)
+
+    assert "FI" in result
+    assert fake_client.calls[0]["url"] == tools._NAGER_HOLIDAYS_URL.format(
+        year=2026, country_code="FI"
+    )
+
+
+def test_get_public_holidays_normalizes_russian_sweden_country_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data=[
+                    {
+                        "date": "2026-01-01",
+                        "localName": "Nyårsdagen",
+                        "name": "New Year's Day",
+                    }
+                ]
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("Швеция", year=2026)
+
+    assert "SE" in result
+    assert fake_client.calls[0]["url"] == tools._NAGER_HOLIDAYS_URL.format(
+        year=2026, country_code="SE"
+    )
+
+
+def test_get_public_holidays_blank_country_rejected_without_http_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not perform HTTP calls for blank input")
+
+    monkeypatch.setattr(tools.httpx, "Client", _explode)
+
+    result = tools.get_public_holidays("   ")
+
+    assert "не может быть пустым" in result.lower()
+
+
+@pytest.mark.parametrize("bad_year", ["2026", True, 2026.5])
+def test_get_public_holidays_non_int_year_rejected_without_http_call(
+    monkeypatch: pytest.MonkeyPatch, bad_year: Any
+) -> None:
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not perform HTTP calls for non-integer year")
+
+    monkeypatch.setattr(tools.httpx, "Client", _explode)
+
+    result = tools.get_public_holidays("FI", year=bad_year)
+
+    assert "год должен быть целым числом" in result.lower()
+
+
+def test_get_public_holidays_unknown_country_returns_safe_error_without_http_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not perform HTTP calls for unknown country name")
+
+    monkeypatch.setattr(tools.httpx, "Client", _explode)
+
+    result = tools.get_public_holidays("Nowhereland", year=2026)
+
+    assert "не удалось распознать страну" in result.lower()
+    assert "именительном падеже" in result.lower()
+
+
+def test_get_public_holidays_invalid_iso_code_returns_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fake_client = FakeHttpxClient([FakeResponse(status_code=404)])
     _install_fake_client(monkeypatch, fake_client)
 
-    result = tools.get_wikipedia_summary("Definitely Not A Real Topic Xyz")
+    result = tools.get_public_holidays("ZZ", year=2026)
 
-    assert "no article found" in result.lower()
+    assert "не предоставляет данные" in result.lower()
 
 
-def test_get_wikipedia_summary_malformed_json_returns_safe_fallback(
+def test_get_public_holidays_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = FakeHttpxClient([FakeResponse(json_data=[])])
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("FI", year=2026)
+
+    assert "не предоставляет данные" in result.lower()
+
+
+@pytest.mark.parametrize("malformed_top_level", [{"not": "a list"}, "not-a-list", None, 42])
+def test_get_public_holidays_non_list_top_level_returns_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, malformed_top_level: Any
+) -> None:
+    fake_client = FakeHttpxClient([FakeResponse(json_data=malformed_top_level)])
+    _install_fake_client(monkeypatch, fake_client)
+
+    with caplog.at_level(logging.WARNING):
+        result = tools.get_public_holidays("FI", year=2026)
+
+    assert "нечитаемый" in result.lower()
+    assert "event=tool_call_failed" in caplog.text
+    assert "tool=get_public_holidays" in caplog.text
+
+
+@pytest.mark.parametrize("malformed_entry", ["not-an-object", 42, ["nested-list"], None])
+def test_get_public_holidays_non_dict_entry_returns_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch, malformed_entry: Any
+) -> None:
+    fake_client = FakeHttpxClient([FakeResponse(json_data=[malformed_entry])])
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("FI", year=2026)
+
+    assert "нечитаемый" in result.lower()
+
+
+@pytest.mark.parametrize("malformed_date", [None, 42, ""])
+def test_get_public_holidays_missing_date_returns_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch, malformed_date: Any
+) -> None:
+    fake_client = FakeHttpxClient(
+        [FakeResponse(json_data=[{"date": malformed_date, "localName": "X", "name": "X"}])]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("FI", year=2026)
+
+    assert "нечитаемый" in result.lower()
+
+
+def test_get_public_holidays_missing_local_name_and_name_uses_generic_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = FakeHttpxClient([FakeResponse(json_data=[{"date": "2026-01-01"}])])
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("FI", year=2026)
+
+    assert "праздник" in result.lower()
+
+
+def test_get_public_holidays_missing_local_name_falls_back_to_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = FakeHttpxClient(
+        [FakeResponse(json_data=[{"date": "2026-01-01", "name": "New Year's Day"}])]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_public_holidays("FI", year=2026)
+
+    assert "New Year's Day" in result
+
+
+def test_get_public_holidays_malformed_json_returns_safe_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class BrokenResponse(FakeResponse):
@@ -645,87 +800,217 @@ def test_get_wikipedia_summary_malformed_json_returns_safe_fallback(
     fake_client = FakeHttpxClient([BrokenResponse()])
     _install_fake_client(monkeypatch, fake_client)
 
-    result = tools.get_wikipedia_summary("Alan Turing")
+    result = tools.get_public_holidays("FI", year=2026)
 
-    assert "unreadable" in result.lower()
-
-
-def test_get_wikipedia_summary_no_extract_returns_safe_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_client = FakeHttpxClient([FakeResponse(json_data={"title": "Alan Turing"})])
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_wikipedia_summary("Alan Turing")
-
-    assert "no summary available" in result.lower()
+    assert "нечитаемый" in result.lower()
 
 
-@pytest.mark.parametrize("malformed_data", [[], "not-an-object", None, 42])
-def test_get_wikipedia_summary_non_dict_response_returns_safe_fallback(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, malformed_data: Any
-) -> None:
-    fake_client = FakeHttpxClient([FakeResponse(json_data=malformed_data)])
-    _install_fake_client(monkeypatch, fake_client)
-
-    with caplog.at_level(logging.WARNING):
-        result = tools.get_wikipedia_summary("Alan Turing")
-
-    assert "unreadable" in result.lower()
-    assert "event=tool_call_failed" in caplog.text
-    assert "tool=get_wikipedia_summary" in caplog.text
-
-
-def test_get_wikipedia_summary_non_dict_desktop_url_does_not_raise(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_client = FakeHttpxClient(
-        [
-            FakeResponse(
-                json_data={
-                    "title": "Alan Turing",
-                    "extract": "A summary.",
-                    # "desktop" is expected to be an object with a "page" key --
-                    # a bare string here is a malformed shape.
-                    "content_urls": {"desktop": "not-an-object"},
-                }
-            )
-        ]
-    )
-    _install_fake_client(monkeypatch, fake_client)
-
-    result = tools.get_wikipedia_summary("Alan Turing")
-
-    assert "Alan Turing" in result
-    assert "A summary." in result
-    assert "source:" not in result
-
-
-def test_get_wikipedia_summary_blank_topic_rejected_without_http_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _explode(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("must not perform HTTP calls for blank input")
-
-    monkeypatch.setattr(tools.httpx, "Client", _explode)
-
-    result = tools.get_wikipedia_summary("   ")
-
-    assert "must not be empty" in result.lower()
-
-
-def test_get_wikipedia_summary_transport_failure_returns_safe_fallback(
+def test_get_public_holidays_transport_failure_returns_safe_fallback(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     fake_client = FakeHttpxClient(exception=httpx.ConnectTimeout("timed out"))
     _install_fake_client(monkeypatch, fake_client)
 
     with caplog.at_level(logging.WARNING):
-        result = tools.get_wikipedia_summary("Alan Turing")
+        result = tools.get_public_holidays("FI", year=2026)
 
-    assert "unavailable" in result.lower()
+    assert "недоступен" in result.lower()
     assert "event=tool_call_failed" in caplog.text
-    assert "tool=get_wikipedia_summary" in caplog.text
+    assert "tool=get_public_holidays" in caplog.text
+
+# ---------------------------------------------------------------------------
+# get_pypi_package_info
+# ---------------------------------------------------------------------------
+
+
+def test_get_pypi_package_info_haystack_ai_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data={
+                    "info": {
+                        "name": "haystack-ai",
+                        "version": "2.4.0",
+                        "summary": "LLM orchestration framework",
+                        "requires_python": ">=3.9",
+                        "license_expression": "Apache-2.0",
+                        "project_urls": {"Homepage": "https://haystack.deepset.ai/"},
+                    }
+                }
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_pypi_package_info("haystack-ai")
+
+    assert "Пакет haystack-ai" in result
+    assert "2.4.0" in result
+    assert "LLM orchestration framework" in result
+    assert ">=3.9" in result
+    assert "Apache-2.0" in result
+    assert "https://haystack.deepset.ai/" in result
+    assert fake_client.calls[0]["url"] == tools._PYPI_PACKAGE_INFO_URL.format(
+        package_name="haystack-ai"
+    )
+
+
+def test_get_pypi_package_info_aiogram_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data={
+                    "info": {
+                        "name": "aiogram",
+                        "version": "3.22.0",
+                        "summary": "Modern and fully asynchronous framework for Telegram Bot API",
+                        "requires_python": ">=3.9",
+                        "license": "MIT",
+                        "project_urls": {"Documentation": "https://docs.aiogram.dev/"},
+                    }
+                }
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_pypi_package_info("aiogram")
+
+    assert "Пакет aiogram" in result
+    assert "3.22.0" in result
+    assert "Telegram Bot API" in result
+    assert "MIT" in result
+    assert "https://docs.aiogram.dev/" in result
+
+
+def test_get_pypi_package_info_normalizes_russian_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data={
+                    "info": {
+                        "name": "aiogram",
+                        "version": "3.22.0",
+                        "summary": "Async Telegram framework",
+                        "requires_python": ">=3.9",
+                        "license": "MIT",
+                        "package_url": "https://pypi.org/project/aiogram/",
+                    }
+                }
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_pypi_package_info("айограм")
+
+    assert "Пакет aiogram" in result
+    assert fake_client.calls[0]["url"] == tools._PYPI_PACKAGE_INFO_URL.format(
+        package_name="aiogram"
+    )
+
+
+@pytest.mark.parametrize(
+    ("alias", "expected_package_name"),
+    [
+        ("Haystack", "haystack-ai"),
+        ("Haystack AI", "haystack-ai"),
+        ("Pinecone Haystack", "pinecone-haystack"),
+        ("пакет Pinecone для Haystack", "pinecone-haystack"),
+        ("айограм", "aiogram"),
+    ],
+)
+def test_normalize_pypi_package_name_maps_documented_aliases(
+    alias: str, expected_package_name: str
+) -> None:
+    assert tools._normalize_pypi_package_name(alias) == expected_package_name
+
+
+def test_get_pypi_package_info_404_package_not_found(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_client = FakeHttpxClient([FakeResponse(status_code=404)])
+    _install_fake_client(monkeypatch, fake_client)
+
+    with caplog.at_level(logging.WARNING):
+        result = tools.get_pypi_package_info("does-not-exist")
+
+    assert "не найден" in result.lower()
+    assert "event=tool_call_failed" in caplog.text
+    assert "tool=get_pypi_package_info" in caplog.text
+
+
+@pytest.mark.parametrize("malformed_payload", [[], {"info": []}])
+def test_get_pypi_package_info_malformed_payload_returns_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch, malformed_payload: Any
+) -> None:
+    fake_client = FakeHttpxClient([FakeResponse(json_data=malformed_payload)])
+    _install_fake_client(monkeypatch, fake_client)
+
+    result = tools.get_pypi_package_info("haystack-ai")
+
+    assert "нечитаемый" in result.lower()
+
+
+def test_get_pypi_package_info_network_failure_returns_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_client = FakeHttpxClient(exception=httpx.ConnectTimeout("timed out"))
+    _install_fake_client(monkeypatch, fake_client)
+
+    with caplog.at_level(logging.WARNING):
+        result = tools.get_pypi_package_info("haystack-ai")
+
+    assert "сервис сейчас недоступен" in result.lower()
+    assert "event=tool_call_failed" in caplog.text
+    assert "tool=get_pypi_package_info" in caplog.text
+
+
+def test_get_pypi_package_info_uses_expected_client_options_and_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = FakeHttpxClient(
+        [
+            FakeResponse(
+                json_data={
+                    "info": {
+                        "name": "haystack-ai",
+                        "version": "2.4.0",
+                        "summary": "LLM orchestration framework",
+                        "requires_python": ">=3.9",
+                        "license": "Apache-2.0",
+                        "package_url": "https://pypi.org/project/haystack-ai/",
+                    }
+                }
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, fake_client)
+
+    tools.get_pypi_package_info("Haystack AI")
+
+    assert fake_client.client_kwargs["timeout"] == 10.0
+    assert fake_client.client_kwargs["follow_redirects"] is True
+    assert fake_client.calls[0]["url"] == tools._PYPI_PACKAGE_INFO_URL.format(
+        package_name="haystack-ai"
+    )
+    assert fake_client.calls[0]["kwargs"]["headers"] == {
+        "Accept": "application/json",
+        "User-Agent": "telegram-vector-memory-bot/0.1 educational project",
+    }
+
+
+def test_get_pypi_package_info_blank_package_name_rejected_without_http_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not perform HTTP calls for blank package name")
+
+    monkeypatch.setattr(tools.httpx, "Client", _explode)
+
+    result = tools.get_pypi_package_info("   ")
+
+    assert "не может быть пустым" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -737,14 +1022,14 @@ def test_get_current_time_success_by_iana_timezone() -> None:
     result = tools.get_current_time("UTC")
 
     assert "UTC" in result
-    assert "Current time for 'UTC'" in result
+    assert "Текущее время для 'UTC'" in result
 
 
 def test_get_current_time_success_by_city_alias() -> None:
     result = tools.get_current_time("Helsinki")
 
     assert "Europe/Helsinki" in result
-    assert "Current time for 'Helsinki'" in result
+    assert "Текущее время для 'Helsinki'" in result
 
 
 @pytest.mark.parametrize(
@@ -779,7 +1064,7 @@ def test_get_current_time_unknown_location_returns_fallback_with_examples(
     with caplog.at_level(logging.WARNING):
         result = tools.get_current_time("Nowhereland")
 
-    assert "unknown city or timezone" in result.lower()
+    assert "неизвестный город или часовой пояс" in result.lower()
     assert "helsinki" in result.lower()
     assert "moscow" in result.lower()
     assert "event=tool_call_failed" in caplog.text
@@ -789,7 +1074,7 @@ def test_get_current_time_unknown_location_returns_fallback_with_examples(
 def test_get_current_time_blank_location_rejected() -> None:
     result = tools.get_current_time("   ")
 
-    assert "must not be empty" in result.lower()
+    assert "не может быть пустым" in result.lower()
 
 
 def test_get_current_time_includes_weekday() -> None:
@@ -797,36 +1082,36 @@ def test_get_current_time_includes_weekday() -> None:
 
     result = tools.get_current_time("UTC")
 
-    weekday_names = {
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
+    weekday_names_ru = {
+        "понедельник",
+        "вторник",
+        "среда",
+        "четверг",
+        "пятница",
+        "суббота",
+        "воскресенье",
     }
-    assert any(day in result for day in weekday_names)
-    # sanity: today's real weekday must be one of the names present
-    assert datetime_module.datetime.now(datetime_module.UTC).strftime("%A") in result
+    assert any(day in result for day in weekday_names_ru)
+    # sanity: сегодняшний реальный день недели должен быть среди присутствующих названий
+    today_english = datetime_module.datetime.now(datetime_module.UTC).strftime("%A")
+    assert tools._WEEKDAY_NAMES_RU[today_english] in result
 
 
 # ---------------------------------------------------------------------------
-# Tool wiring
+# Регистрация инструментов
 # ---------------------------------------------------------------------------
 
 
 def test_build_default_tools_returns_all_five_tools_with_expected_names() -> None:
     tool_list = tools.build_default_tools()
 
-    names = {tool.name for tool in tool_list}
-    assert names == {
+    assert [tool.name for tool in tool_list] == [
         "get_current_weather",
         "convert_currency",
-        "get_country_info",
-        "get_wikipedia_summary",
         "get_current_time",
-    }
+        "get_public_holidays",
+        "get_pypi_package_info",
+    ]
 
 
 def test_weather_tool_function_and_required_parameters() -> None:
@@ -839,14 +1124,14 @@ def test_currency_tool_function_and_required_parameters() -> None:
     assert tools.currency_tool.parameters["required"] == ["amount", "from_currency", "to_currency"]
 
 
-def test_country_info_tool_function_and_required_parameters() -> None:
-    assert tools.country_info_tool.function is tools.get_country_info
-    assert tools.country_info_tool.parameters["required"] == ["country"]
+def test_public_holidays_tool_function_and_required_parameters() -> None:
+    assert tools.public_holidays_tool.function is tools.get_public_holidays
+    assert tools.public_holidays_tool.parameters["required"] == ["country"]
 
 
-def test_wikipedia_summary_tool_function_and_required_parameters() -> None:
-    assert tools.wikipedia_summary_tool.function is tools.get_wikipedia_summary
-    assert tools.wikipedia_summary_tool.parameters["required"] == ["topic"]
+def test_pypi_package_info_tool_function_and_required_parameters() -> None:
+    assert tools.pypi_package_info_tool.function is tools.get_pypi_package_info
+    assert tools.pypi_package_info_tool.parameters["required"] == ["package_name"]
 
 
 def test_time_tool_function_and_required_parameters() -> None:
@@ -860,3 +1145,41 @@ def test_build_default_tools_returns_a_fresh_list_each_call() -> None:
 
     assert first == second
     assert first is not second
+
+
+_CYRILLIC_PATTERN = re.compile(r"[Ѐ-ӿ]")
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        tools.weather_tool,
+        tools.currency_tool,
+        tools.time_tool,
+        tools.public_holidays_tool,
+        tools.pypi_package_info_tool,
+    ],
+    ids=lambda tool: tool.name,
+)
+def test_tool_description_is_in_russian(tool: Tool) -> None:
+    assert _CYRILLIC_PATTERN.search(tool.description), (
+        f"{tool.name} description must be in Russian: {tool.description!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        tools.weather_tool,
+        tools.currency_tool,
+        tools.time_tool,
+        tools.public_holidays_tool,
+        tools.pypi_package_info_tool,
+    ],
+    ids=lambda tool: tool.name,
+)
+def test_tool_parameter_descriptions_are_in_russian(tool: Tool) -> None:
+    for param_name, schema in tool.parameters["properties"].items():
+        assert _CYRILLIC_PATTERN.search(schema["description"]), (
+            f"{tool.name}.{param_name} description must be in Russian: {schema['description']!r}"
+        )

@@ -1,20 +1,21 @@
-"""aiogram 3 Telegram application layer.
+"""Слой Telegram-приложения на aiogram 3.
 
-Wires the four Stage 5 commands and the ordinary text-message flow on top of
-the existing, synchronous ``MemoryService`` and the tool-using
-``HaystackAgentService``. This module constructs no external client and no
-``Settings`` object at import time -- everything is built inside
-:func:`run_bot`, which only runs when the module is executed as a script.
+Связывает четыре команды Stage 5 и обычный поток текстовых сообщений поверх
+уже существующего синхронного ``MemoryService`` и использующего инструменты
+``HaystackAgentService``. Этот модуль не создаёт ни внешнего клиента, ни
+объекта ``Settings`` во время импорта -- всё строится внутри :func:`run_bot`,
+который выполняется только при запуске модуля как скрипта.
 
-``ChatService`` (plain, non-tool-using Chat Completions adapter) remains in
-the codebase as a legacy adapter -- fully implemented and tested in
-``chat_service.py`` -- but is no longer wired into the live message flow.
+``ChatService`` (простой адаптер Chat Completions без инструментов) остаётся
+в кодовой базе как legacy-adapter -- полностью реализован и протестирован в
+``chat_service.py`` -- но больше не подключён к живому потоку сообщений.
 
-Message flow for ordinary text: recall -> agent reply generation (which may
-call tools) -> send every reply chunk -> remember, in that order.
-``remember`` only ever runs after every reply chunk has been sent
-successfully; a failed send re-raises so aiogram's own error boundary
-handles it, and never triggers ``remember``.
+Поток обработки обычного текста: recall -> генерация ответа агентом (который
+может вызывать инструменты) -> отправка каждого фрагмента ответа -> remember,
+именно в таком порядке. ``remember`` выполняется только после того, как все
+фрагменты ответа успешно отправлены; неудачная отправка выбрасывает
+исключение повторно, чтобы его обработал собственный error boundary aiogram,
+и ``remember`` при этом никогда не вызывается.
 """
 
 from __future__ import annotations
@@ -37,9 +38,10 @@ logger = logging.getLogger(__name__)
 
 _TELEGRAM_MESSAGE_LIMIT: Final = 4096
 
-# Fixed, safe user-facing responses. Private by design -- tests assert the
-# literal text independently rather than importing these constants, so a
-# change here can't silently drag a stale test expectation along with it.
+# Фиксированные, безопасные ответы пользователю. Намеренно приватные --
+# тесты проверяют буквальный текст независимо, а не импортируют эти
+# константы, так что изменение здесь не может незаметно утащить за собой
+# устаревшее ожидание в тесте.
 _START_MESSAGE: Final = (
     "Привет! Я запоминаю то, что вы мне пишете, и использую эти воспоминания "
     "как контекст в разговоре.\n"
@@ -62,18 +64,19 @@ _UNKNOWN_COMMAND_REPLY: Final = "Неизвестная команда. Набе
 _CHAT_FAILURE_REPLY: Final = "Извините, не получилось сформировать ответ. Попробуйте ещё раз."
 _NON_TEXT_REPLY: Final = "Пока я понимаю только текстовые сообщения."
 
-# Matches any syntactically valid Telegram bot command name (letters, digits,
-# underscore, 1-32 characters) -- used as a catch-all so the unknown-command
-# route relies on aiogram's own Command filter (and its bot-mention
-# validation) instead of a bespoke slash-prefix/mention parser.
+# Совпадает с любым синтаксически корректным именем команды Telegram-бота
+# (буквы, цифры, подчёркивание, 1-32 символа) -- используется как catch-all,
+# чтобы маршрут "неизвестная команда" полагался на собственный фильтр
+# Command aiogram (и его валидацию bot-mention) вместо самодельного парсера
+# slash-префикса/mention.
 _COMMAND_NAME_PATTERN: Final = re.compile(r"^[A-Za-z0-9_]{1,32}$")
 
 
 def _pluralize_records_ru(count: int) -> str:
-    """Russian plural form of "records" for a non-negative *count*.
+    """Русская форма множественного числа слова "запись" для неотрицательного *count*.
 
-    A small, fixed grammatical rule for one word -- not a general
-    localization layer.
+    Небольшое, фиксированное грамматическое правило для одного слова -- а не
+    полноценный слой локализации.
     """
     remainder_100 = count % 100
     remainder_10 = count % 10
@@ -87,17 +90,17 @@ def _pluralize_records_ru(count: int) -> str:
 
 
 def split_telegram_text(text: str, *, limit: int = _TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    """Split *text* into Telegram-safe chunks measured in UTF-16 code units.
+    """Разбить *text* на безопасные для Telegram фрагменты, измеряемые в UTF-16 code units.
 
-    A deterministic hard split -- it does not try to break on word or
-    paragraph boundaries. Concatenating the returned chunks always
-    reproduces *text* exactly, preserves order, and never produces an empty
-    chunk. Every emitted chunk stays within *limit* UTF-16 code units: if a
-    single Unicode code point (e.g. certain emoji, which take 2 UTF-16 code
-    units) would itself exceed *limit*, that is a request that can never be
-    satisfied without splitting the code point into an invalid surrogate
-    half, so this raises ``ValueError`` instead of emitting an over-limit or
-    empty chunk.
+    Детерминированное жёсткое разбиение -- не пытается разбивать по границам
+    слов или абзацев. Конкатенация возвращённых фрагментов всегда точно
+    воспроизводит *text*, сохраняет порядок и никогда не создаёт пустой
+    фрагмент. Каждый выданный фрагмент укладывается в *limit* UTF-16
+    code units: если один code point Unicode (например, некоторые эмодзи,
+    занимающие 2 UTF-16 code units) сам по себе превышает *limit*, это
+    запрос, который в принципе невозможно удовлетворить без разбиения
+    code point на невалидную суррогатную половину, поэтому вместо превышающего
+    лимит или пустого фрагмента выбрасывается ``ValueError``.
     """
     if not isinstance(text, str) or not text.strip():
         raise ValueError("text must not be empty or whitespace-only")
@@ -132,37 +135,41 @@ def _is_command_text(text: str | None) -> bool:
 
 
 def is_ordinary_text_message(message: Message) -> bool:
-    """True for plain text messages that are not slash commands.
+    """True для обычных текстовых сообщений, не являющихся slash-командами.
 
-    Structurally excludes commands from the ordinary-text handler by
-    content (a leading "/"), independent of handler registration order.
+    Структурно исключает команды из обработчика обычного текста по
+    содержимому (ведущий "/"), независимо от порядка регистрации хендлеров.
     """
     return isinstance(message.text, str) and not _is_command_text(message.text)
 
 
 def is_non_text_message(message: Message) -> bool:
-    """True only when the message genuinely has no text (photo, sticker, etc.).
+    """True только когда у сообщения действительно нет текста (фото, стикер и т.д.).
 
-    Kept structurally narrow on purpose: this is the only filter for
-    :func:`handle_non_text_message`, so it must never also match malformed
-    slash-prefixed text (that is absorbed earlier by
-    :func:`ignore_malformed_command`) or any other text message.
+    Намеренно оставлен структурно узким: это единственный фильтр для
+    :func:`handle_non_text_message`, поэтому он никогда не должен совпадать ни
+    с некорректным slash-текстом (его раньше поглощает
+    :func:`ignore_malformed_command`), ни с любым другим текстовым
+    сообщением.
     """
     return message.text is None
 
 
 async def cmd_start(message: Message) -> None:
-    """Send a short welcome. Touches no services."""
+    """Отправить короткое приветствие. Не обращается ни к одному сервису."""
     await message.answer(_START_MESSAGE)
 
 
 async def cmd_help(message: Message) -> None:
-    """List the four commands and briefly explain ordinary messages. Touches no services."""
+    """Перечислить четыре команды и коротко объяснить обычные сообщения.
+
+    Не обращается ни к одному сервису.
+    """
     await message.answer(_HELP_MESSAGE)
 
 
 async def cmd_memory(message: Message, memory_service: MemoryService) -> None:
-    """Reply with the total number of stored memories for this user."""
+    """Ответить общим числом сохранённых воспоминаний этого пользователя."""
     from_user = message.from_user
     if from_user is None:
         return
@@ -178,7 +185,7 @@ async def cmd_memory(message: Message, memory_service: MemoryService) -> None:
 
 
 async def cmd_forget_me(message: Message, memory_service: MemoryService) -> None:
-    """Delete all stored memories for this user."""
+    """Удалить все сохранённые воспоминания этого пользователя."""
     from_user = message.from_user
     if from_user is None:
         return
@@ -194,38 +201,43 @@ async def cmd_forget_me(message: Message, memory_service: MemoryService) -> None
 
 
 async def handle_unknown_command(message: Message) -> None:
-    """Reply to any slash command not matched by a known handler. Touches no services."""
+    """Ответить на любую slash-команду, не совпавшую с известным хендлером.
+
+    Не обращается ни к одному сервису.
+    """
     await message.answer(_UNKNOWN_COMMAND_REPLY)
 
 
 async def ignore_foreign_command(message: Message) -> None:
-    """Silently absorb a command-shaped message addressed to another bot.
+    """Молча поглотить командо-подобное сообщение, адресованное другому боту.
 
-    Reached only when a command's ``@mention`` suffix did not match this
-    bot's own username -- aiogram's ``Command`` filter already rejected it
-    for every earlier handler. Sends no reply and touches no service, so
-    the update does not fall through to the ordinary-text or non-text
-    catch-all handlers either.
+    Достигается только когда суффикс ``@mention`` команды не совпал с
+    username этого бота -- фильтр ``Command`` aiogram уже отклонил его для
+    всех более ранних хендлеров. Не отправляет ответ и не обращается ни к
+    одному сервису, так что обновление не проваливается ни в обработчик
+    обычного текста, ни в catch-all для нетекстовых сообщений.
     """
     return None
 
 
 async def ignore_malformed_command(message: Message) -> None:
-    """Silently absorb slash-prefixed text that is not a syntactically valid command.
+    """Молча поглотить slash-текст, не являющийся синтаксически корректной командой.
 
-    Reached only for text starting with "/" that matched neither a known
-    command, the unknown-command catch-all, nor the foreign-bot-mention
-    catch-all (e.g. "/", "//help", "/foo-bar"). Sends no reply and touches
-    no service, so it can never fall into ordinary-text processing or the
-    non-text handler either.
+    Достигается только для текста, начинающегося с "/", который не совпал ни
+    с известной командой, ни с catch-all для неизвестной команды, ни с
+    catch-all для чужого бота (например, "/", "//help", "/foo-bar"). Не
+    отправляет ответ и не обращается ни к одному сервису, так что не может
+    провалиться ни в обработку обычного текста, ни в обработчик нетекстовых
+    сообщений.
     """
     return None
 
 
 async def handle_non_text_message(message: Message) -> None:
-    """Reply to photos, stickers, voice, documents, and any other non-text update.
+    """Ответить на фото, стикеры, голосовые, документы и любое другое нетекстовое обновление.
 
-    Touches no services -- never calls recall, chat generation, or remember.
+    Не обращается ни к одному сервису -- никогда не вызывает recall,
+    генерацию ответа или remember.
     """
     await message.answer(_NON_TEXT_REPLY)
 
@@ -235,15 +247,17 @@ async def handle_text_message(
     memory_service: MemoryService,
     reply_service: HaystackAgentService,
 ) -> None:
-    """Ordinary text-message flow: recall -> generate -> send -> remember.
+    """Поток обработки обычного текста: recall -> generate -> send -> remember.
 
-    ``reply_service`` generates the reply; in production this is a
-    ``HaystackAgentService``, which may call a weather, currency,
-    country-info, or Wikipedia tool on its own before answering. ``remember``
-    only runs after every reply chunk has been sent successfully. A send
-    failure re-raises (after safe logging) so aiogram's own error boundary
-    handles it, and skips ``remember`` entirely by simply never reaching
-    that line.
+    ``reply_service`` генерирует ответ; в production это
+    ``HaystackAgentService``, который может сам вызвать инструмент погоды,
+    валюты, текущего времени, праздников или факта о числе, прежде чем
+    ответить.
+    ``remember`` выполняется только после того, как все фрагменты ответа
+    успешно отправлены. Сбой отправки выбрасывает исключение повторно (после
+    безопасного логирования), чтобы его обработал собственный error boundary
+    aiogram, и ``remember`` при этом полностью пропускается, просто никогда
+    не доходя до этой строки.
     """
     user_text = message.text
     if not isinstance(user_text, str) or not user_text.strip():
@@ -280,9 +294,10 @@ async def handle_text_message(
         for chunk in chunks:
             await message.answer(chunk)
     except Exception as exc:
-        # Broad catch is deliberate and narrowly scoped to Telegram sending:
-        # a failed send must never be followed by remember(), and aiogram's
-        # own error boundary -- not a second message from us -- handles it.
+        # Широкий except намеренный и узко ограничен отправкой в Telegram:
+        # неудачная отправка никогда не должна сопровождаться remember(), а
+        # обрабатывает её собственный error boundary aiogram -- а не второе
+        # сообщение от нас.
         logger.warning("event=send_failed error_type=%s", type(exc).__name__)
         raise
 
@@ -330,10 +345,10 @@ def create_dispatcher(
     memory_service: MemoryService,
     reply_service: HaystackAgentService,
 ) -> Dispatcher:
-    """Build the Stage 5 Dispatcher with both services as contextual data.
+    """Построить Dispatcher Stage 5 с обоими сервисами как контекстными данными.
 
-    Handlers receive *memory_service* / *reply_service* by parameter name via
-    aiogram's workflow data -- no module-level mutable singleton is used.
+    Хендлеры получают *memory_service* / *reply_service* по имени параметра
+    через workflow data aiogram -- без модульного изменяемого singleton.
     """
     dispatcher = Dispatcher(memory_service=memory_service, reply_service=reply_service)
     dispatcher.include_router(_build_router())
@@ -341,7 +356,7 @@ def create_dispatcher(
 
 
 async def run_bot() -> None:
-    """Construct every service and start long polling. Never runs at import time."""
+    """Сконструировать все сервисы и запустить long polling. Никогда не выполняется при импорте."""
     settings = get_settings()
     manager = PineconeManager(settings)
     memory_service = MemoryService(manager=manager, settings=settings)
