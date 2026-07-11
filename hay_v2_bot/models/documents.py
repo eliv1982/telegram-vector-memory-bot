@@ -25,6 +25,24 @@ SupportedDocumentContentType = Literal[
 ]
 
 
+def validate_base_file_name(value: str) -> str:
+    """Validate that a value is a non-blank base filename."""
+    if not value.strip():
+        raise ValueError("file_name must not be empty or whitespace-only")
+    if value in _PATH_ONLY_NAMES:
+        raise ValueError("file_name must be a base filename, not a path")
+    if PurePosixPath(value).name != value or PureWindowsPath(value).name != value:
+        raise ValueError("file_name must be a base filename, not a path")
+    return value
+
+
+def normalize_utc_datetime(value: datetime, *, field_name: str) -> datetime:
+    """Require a timezone-aware datetime and normalize it to UTC."""
+    if value.tzinfo is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return value.astimezone(UTC)
+
+
 class DocumentChunkMetadata(BaseModel):
     """Immutable metadata contract for a stored document chunk."""
 
@@ -43,13 +61,7 @@ class DocumentChunkMetadata(BaseModel):
     @field_validator("file_name")
     @classmethod
     def _validate_file_name(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("file_name must not be empty or whitespace-only")
-        if value in _PATH_ONLY_NAMES:
-            raise ValueError("file_name must be a base filename, not a path")
-        if PurePosixPath(value).name != value or PureWindowsPath(value).name != value:
-            raise ValueError("file_name must be a base filename, not a path")
-        return value
+        return validate_base_file_name(value)
 
     @field_validator("file_hash")
     @classmethod
@@ -59,9 +71,7 @@ class DocumentChunkMetadata(BaseModel):
     @field_validator("uploaded_at")
     @classmethod
     def _normalize_uploaded_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None:
-            raise ValueError("uploaded_at must be timezone-aware")
-        return value.astimezone(UTC)
+        return normalize_utc_datetime(value, field_name="uploaded_at")
 
     @field_validator("headings", mode="before")
     @classmethod
