@@ -57,7 +57,8 @@ def test_ingestion_pipeline_builds_with_verified_wiring_and_overwrite_policy() -
     assert writer.document_store is store
 
 
-def test_summary_pipeline_builds_with_one_sentence_prompt_and_deterministic_generator() -> None:
+def test_summary_pipeline_builds_with_russian_single_sentence_prompt_and_deterministic_generator(
+) -> None:
     settings = _settings()
 
     pipeline = build_summary_pipeline(settings)
@@ -70,14 +71,18 @@ def test_summary_pipeline_builds_with_one_sentence_prompt_and_deterministic_gene
     assert inputs["prompt_builder"]["file_name"]["is_mandatory"] is True
     assert inputs["prompt_builder"]["document_context"]["is_mandatory"] is True
     assert prompt_builder.required_variables == ["file_name", "document_context"]
-    assert "exactly one concise sentence" in system_text
+    assert "exactly one concise sentence in Russian" in system_text
+    assert "Preserve names, dates, numbers, currencies, and technical terms" in system_text
+    assert "source document is in English" in system_text
+    assert "natural Russian" in system_text
+    assert INSUFFICIENT_DOCUMENT_ANSWER not in system_text
     assert "{{ document_context }}" in user_text
     assert generator.model == "chat-model"
     assert generator.api_base_url == "https://example.invalid/v1"
     assert generator.generation_kwargs == {"temperature": 0}
 
 
-def test_rag_pipeline_builds_with_retriever_filter_and_exact_fallback_prompt() -> None:
+def test_rag_pipeline_builds_with_russian_answer_contract_and_exact_fallback_prompt() -> None:
     settings = _settings()
     store = _document_store()
 
@@ -102,6 +107,9 @@ def test_rag_pipeline_builds_with_retriever_filter_and_exact_fallback_prompt() -
         "operator": "==",
         "value": "document_chunk",
     }
+    assert "Answer only from the retrieved documents." in system_text
+    assert "Answer in Russian even if the retrieved documents are in English." in system_text
+    assert "Preserve exact names, dates, numbers, currencies, and units." in system_text
     assert INSUFFICIENT_DOCUMENT_ANSWER in system_text
     assert generator.model == "chat-model"
     assert generator.api_base_url == "https://example.invalid/v1"

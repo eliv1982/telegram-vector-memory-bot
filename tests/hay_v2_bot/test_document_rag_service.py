@@ -288,7 +288,15 @@ def test_ingest_and_summarize_successful_conversion_write_and_summary() -> None:
     summary_pipeline = FakePipelineRunner(
         result={
             "generator": {
-                "replies": [ChatMessage.from_assistant(text='"Budget summary. Extra sentence."')]
+                "replies": [
+                    ChatMessage.from_assistant(
+                        text=(
+                            '"Документ описывает запуск пилотного проекта Orion, '
+                            "его бюджет, порядок эскалации инцидентов и правила "
+                            'пересмотра документа."'
+                        )
+                    )
+                ]
             }
         }
     )
@@ -307,7 +315,10 @@ def test_ingest_and_summarize_successful_conversion_write_and_summary() -> None:
     assert outcome.chunk_count == 2
     assert outcome.documents_written == 2
     assert outcome.document_ids == ("doc-1", "doc-2")
-    assert outcome.summary == "Budget summary."
+    assert outcome.summary.startswith("Документ описывает запуск пилотного проекта Orion")
+    assert "бюджет" in outcome.summary
+    assert "эскалации" in outcome.summary
+    assert "пересмотра документа" in outcome.summary
     assert store_factory.created_user_ids == [123]
     assert ingestion_pipeline.calls == [{"embedder": {"documents": list(_documents())}}]
     assert summary_pipeline.calls[0]["prompt_builder"]["file_name"] == "sample.pdf"
@@ -404,7 +415,13 @@ def test_answer_question_returns_grounded_sources_preserves_order_and_deduplicat
     retriever = FakeComponent(result={"documents": list(retrieved_documents)})
     prompt_builder = FakeComponent(result={"prompt": [ChatMessage.from_user(text="prompt")]})
     generator = FakeComponent(
-        result={"replies": [ChatMessage.from_assistant(text="The budget is 4.2 million euros.")]}
+        result={
+            "replies": [
+                ChatMessage.from_assistant(
+                    text="Утвержденный бюджет пилотного проекта Orion составляет 4,2 миллиона евро."
+                )
+            ]
+        }
     )
     store_factory = FakeStoreFactory()
     service = DocumentRagService(
@@ -424,7 +441,9 @@ def test_answer_question_returns_grounded_sources_preserves_order_and_deduplicat
 
     answer = service.answer_question(123, "  What is the approved budget?  ")
 
-    assert answer.answer == "The budget is 4.2 million euros."
+    assert answer.answer.startswith("Утвержденный бюджет пилотного проекта Orion")
+    assert "4,2" in answer.answer
+    assert "миллиона евро" in answer.answer
     assert answer.fallback_used is False
     assert answer.used_document_count == 2
     assert [source.document_id for source in answer.sources] == ["doc-1", "doc-2"]
@@ -504,6 +523,95 @@ def test_answer_question_marks_exact_fallback_reply() -> None:
     assert answer.answer == INSUFFICIENT_DOCUMENT_ANSWER
     assert answer.fallback_used is True
     assert answer.used_document_count == 1
+
+
+def test_english_document_chunks_still_allow_russian_summary_and_rag_answer() -> None:
+    english_documents = (
+        Document(
+            id="doc-1",
+            content="The Orion pilot starts on 15 September 2026.",
+            meta={
+                "record_type": "document_chunk",
+                "user_id": 123,
+                "file_name": "sample.pdf",
+                "file_hash": VALID_HASH,
+                "chunk_index": 0,
+                "content_type": PDF_CONTENT_TYPE,
+                "uploaded_at": UPLOAD_TIME.isoformat(),
+            },
+        ),
+        Document(
+            id="doc-2",
+            content="The approved budget is 4.2 million euros.",
+            meta={
+                "record_type": "document_chunk",
+                "user_id": 123,
+                "file_name": "sample.pdf",
+                "file_hash": VALID_HASH,
+                "chunk_index": 1,
+                "content_type": PDF_CONTENT_TYPE,
+                "uploaded_at": UPLOAD_TIME.isoformat(),
+                "page_number": 1,
+            },
+        ),
+    )
+    summary_pipeline = FakePipelineRunner(
+        result={
+            "generator": {
+                "replies": [
+                    ChatMessage.from_assistant(
+                        text=(
+                            "Документ описывает запуск пилотного проекта Orion, "
+                            "его бюджет, порядок эскалации инцидентов и правила "
+                            "пересмотра документа."
+                        )
+                    )
+                ]
+            }
+        }
+    )
+    rag_pipeline = FakeRagPipeline(
+        {
+            "text_embedder": FakeComponent(result={"embedding": [0.1, 0.2, 0.3]}),
+            "retriever": FakeComponent(result={"documents": list(english_documents)}),
+            "prompt_builder": FakeComponent(
+                result={"prompt": [ChatMessage.from_user(text="prompt")]}
+            ),
+            "generator": FakeComponent(
+                result={
+                    "replies": [
+                        ChatMessage.from_assistant(
+                            text=(
+                                "Утвержденный бюджет пилотного проекта Orion "
+                                "составляет 4,2 миллиона евро."
+                            )
+                        )
+                    ]
+                }
+            ),
+        }
+    )
+    service = DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(result=_conversion_result(english_documents)),
+        document_store_factory=FakeStoreFactory(),
+        ingestion_pipeline_factory=lambda settings, store: FakePipelineRunner(
+            result={"writer": {"documents_written": 2}}
+        ),
+        summary_pipeline_factory=lambda settings: summary_pipeline,
+        rag_pipeline_factory=lambda settings, store: rag_pipeline,
+    )
+
+    outcome = service.ingest_and_summarize(_request())
+    answer = service.answer_question(123, "Какой бюджет утвержден для пилотного проекта Orion?")
+
+    assert "Orion" in outcome.summary
+    assert "бюджет" in outcome.summary
+    assert "4,2" in answer.answer
+    assert "евро" in answer.answer
+    assert "Orion" in answer.answer
+    assert answer.fallback_used is False
 
 
 def test_answer_question_rejects_blank_question_overlong_question_and_bool_user_id() -> None:

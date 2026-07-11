@@ -56,8 +56,12 @@ def build_summary_pipeline(settings: DocumentRagSettings) -> Pipeline:
             template=[
                 ChatMessage.from_system(
                     "You summarize only the supplied document. "
-                    "Return exactly one concise sentence. "
-                    "Do not add unsupported facts."
+                    "Return exactly one concise sentence in Russian. "
+                    "Preserve names, dates, numbers, currencies, and technical terms "
+                    "accurately. "
+                    "Do not add unsupported facts. "
+                    "If the source document is in English, translate its meaning into "
+                    "natural Russian instead of copying an English sentence."
                 ),
                 ChatMessage.from_user(
                     "File name: {{ file_name }}\n\n"
@@ -109,6 +113,8 @@ def build_rag_pipeline(
             template=[
                 ChatMessage.from_system(
                     "Answer only from the retrieved documents. "
+                    "Answer in Russian even if the retrieved documents are in English. "
+                    "Preserve exact names, dates, numbers, currencies, and units. "
                     "Do not use unsupported external facts. "
                     "If the evidence is insufficient, return exactly: "
                     f'"{INSUFFICIENT_DOCUMENT_ANSWER}"'
