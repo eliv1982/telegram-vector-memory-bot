@@ -7,6 +7,12 @@ from .documents import (
     SUPPORTED_DOCUMENT_CONTENT_TYPES,
     DocumentChunkMetadata,
 )
+from .rag import (
+    INSUFFICIENT_DOCUMENT_ANSWER,
+    DocumentAnswer,
+    DocumentIngestionOutcome,
+    DocumentSource,
+)
 
 __all__ = [
     "DOCX_CONTENT_TYPE",
@@ -15,4 +21,8 @@ __all__ = [
     "DocumentConversionRequest",
     "DocumentConversionResult",
     "DocumentChunkMetadata",
+    "DocumentAnswer",
+    "DocumentIngestionOutcome",
+    "DocumentSource",
+    "INSUFFICIENT_DOCUMENT_ANSWER",
 ]
