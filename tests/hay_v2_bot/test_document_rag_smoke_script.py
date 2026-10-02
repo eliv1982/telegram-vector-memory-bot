@@ -29,6 +29,10 @@ class FakeStoreFactory:
         self._fetch_index = 0
         self.delete_calls: list[tuple[int, tuple[str, ...]]] = []
         self.fetch_calls: list[tuple[int, tuple[str, ...]]] = []
+        self.namespace_purges: list[int] = []
+
+    def delete_user_namespace(self, user_id: int) -> None:
+        self.namespace_purges.append(user_id)
 
     def delete_documents(self, user_id: int, document_ids: tuple[str, ...]) -> None:
         self.delete_calls.append((user_id, tuple(document_ids)))
@@ -161,6 +165,149 @@ def test_cli_parser_accepts_controlled_pdf_and_required_question(
     assert parsed.content_type == PDF_CONTENT_TYPE
     assert parsed.user_id == 900000002
     assert parsed.question == "What is the approved budget for the Orion pilot?"
+
+
+@pytest.mark.parametrize("user_id", ["1", "123456789", "899999999", "1000000000", "-900000001"])
+def test_cli_parser_rejects_non_synthetic_user_ids(
+    script_ns: dict[str, Any],
+    sample_pdf: Path,
+    user_id: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = script_ns["build_arg_parser"]()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            [
+                "--file",
+                str(sample_pdf),
+                "--content-type",
+                PDF_CONTENT_TYPE,
+                "--user-id",
+                user_id,
+                "--question",
+                "What is the approved budget for the Orion pilot?",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "synthetic" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("user_id", [900000000, 900000002, 999999999])
+def test_validate_synthetic_user_id_accepts_the_reserved_block(
+    script_ns: dict[str, Any],
+    user_id: int,
+) -> None:
+    script_ns["validate_synthetic_user_id"](user_id)
+
+
+def test_validate_synthetic_user_id_rejects_booleans(script_ns: dict[str, Any]) -> None:
+    with pytest.raises(script_ns["SmokeScriptError"]):
+        script_ns["validate_synthetic_user_id"](True)
+
+
+@pytest.mark.parametrize("user_id", [0, 1, 123456789, 899999999, 1000000000])
+def test_run_document_rag_smoke_refuses_non_synthetic_user_id_before_any_service_is_built(
+    script_ns: dict[str, Any],
+    sample_pdf: Path,
+    user_id: int,
+) -> None:
+    def must_not_be_called(*_: Any) -> Any:
+        raise AssertionError("no settings, store or service may be created for a real-looking ID")
+
+    with pytest.raises(script_ns["SmokeScriptControlledFailure"]) as exc_info:
+        script_ns["run_document_rag_smoke"](
+            file_path=sample_pdf,
+            content_type=PDF_CONTENT_TYPE,
+            user_id=user_id,
+            question="What is the approved budget for the Orion pilot?",
+            processing_settings_factory=must_not_be_called,
+            rag_settings_factory=must_not_be_called,
+            document_store_factory_builder=must_not_be_called,
+            service_factory=must_not_be_called,
+        )
+
+    report = exc_info.value.report
+    assert report["status"] == "failure"
+    assert report["cleanup_attempted"] is False
+    assert "synthetic" in str(exc_info.value)
+
+
+def test_interrupted_ingestion_without_reported_ids_purges_the_synthetic_namespace(
+    script_ns: dict[str, Any],
+    sample_pdf: Path,
+) -> None:
+    store_factory = FakeStoreFactory()
+    service = FakeService(ingest_exception=KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        script_ns["run_document_rag_smoke"](
+            file_path=sample_pdf,
+            content_type=PDF_CONTENT_TYPE,
+            user_id=900000002,
+            question="What is the approved budget for the Orion pilot?",
+            processing_settings_factory=lambda: object(),
+            rag_settings_factory=lambda: object(),
+            document_store_factory_builder=lambda _: store_factory,
+            service_factory=lambda *_: service,
+        )
+
+    assert store_factory.namespace_purges == [900000002]
+    assert store_factory.delete_calls == []
+
+
+def test_namespace_purge_failure_is_reported_as_cleanup_failure(
+    script_ns: dict[str, Any],
+    sample_pdf: Path,
+) -> None:
+    class FailingPurgeStoreFactory(FakeStoreFactory):
+        def delete_user_namespace(self, user_id: int) -> None:
+            raise script_ns["DocumentStoreError"]("purge failed")
+
+    store_factory = FailingPurgeStoreFactory()
+    service = FakeService(ingest_exception=DocumentQuestionError("Question answering failed"))
+
+    with pytest.raises(script_ns["SmokeScriptControlledFailure"]) as exc_info:
+        script_ns["run_document_rag_smoke"](
+            file_path=sample_pdf,
+            content_type=PDF_CONTENT_TYPE,
+            user_id=900000002,
+            question="What is the approved budget for the Orion pilot?",
+            processing_settings_factory=lambda: object(),
+            rag_settings_factory=lambda: object(),
+            document_store_factory_builder=lambda _: store_factory,
+            service_factory=lambda *_: service,
+        )
+
+    report = exc_info.value.report
+    assert report["status"] == "failure"
+    assert report["cleanup_attempted"] is True
+    assert report["cleanup_succeeded"] is False
+    assert report["warnings"] == ["Cleanup deletion failed."]
+
+
+def test_keep_records_never_purges_the_namespace(
+    script_ns: dict[str, Any],
+    sample_pdf: Path,
+) -> None:
+    store_factory = FakeStoreFactory()
+    service = FakeService(ingest_exception=DocumentQuestionError("Question answering failed"))
+
+    with pytest.raises(script_ns["SmokeScriptControlledFailure"]):
+        script_ns["run_document_rag_smoke"](
+            file_path=sample_pdf,
+            content_type=PDF_CONTENT_TYPE,
+            user_id=900000002,
+            question="What is the approved budget for the Orion pilot?",
+            keep_records=True,
+            processing_settings_factory=lambda: object(),
+            rag_settings_factory=lambda: object(),
+            document_store_factory_builder=lambda _: store_factory,
+            service_factory=lambda *_: service,
+        )
+
+    assert store_factory.namespace_purges == []
 
 
 def test_run_document_rag_smoke_success_report_is_json_safe_and_cleanup_verified(

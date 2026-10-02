@@ -374,7 +374,7 @@ async def run_bot() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=get_settings().LOG_LEVEL, format="%(levelname)s %(message)s")
     asyncio.run(run_bot())
 
 

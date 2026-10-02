@@ -16,6 +16,7 @@ from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _NAMESPACE_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 def _require_non_blank(value: str, field_name: str) -> str:
@@ -108,7 +109,10 @@ class Settings(BaseSettings):
     @field_validator("LOG_LEVEL")
     @classmethod
     def _normalize_log_level(cls, value: str) -> str:
-        return _require_non_blank(value, "LOG_LEVEL").upper()
+        level = _require_non_blank(value, "LOG_LEVEL").strip().upper()
+        if level not in _LOG_LEVELS:
+            raise ValueError(f"LOG_LEVEL must be one of {', '.join(_LOG_LEVELS)}")
+        return level
 
 
 @lru_cache

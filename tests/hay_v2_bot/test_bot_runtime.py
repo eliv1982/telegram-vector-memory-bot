@@ -52,6 +52,27 @@ def _rag_settings(**overrides: Any) -> DocumentRagSettings:
     return DocumentRagSettings(_env_file=None, **data)
 
 
+def test_main_configures_logging_from_log_level_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logging_kwargs: list[dict[str, Any]] = []
+    calls: list[str] = []
+
+    async def fake_run_bot() -> None:
+        calls.append("run_bot")
+
+    monkeypatch.setattr(runtime_module, "run_bot", fake_run_bot)
+    monkeypatch.setattr(runtime_module, "get_settings", lambda: _settings(LOG_LEVEL="debug"))
+    monkeypatch.setattr(
+        runtime_module.logging, "basicConfig", lambda **kwargs: logging_kwargs.append(kwargs)
+    )
+
+    runtime_module.main()
+
+    assert [kwargs["level"] for kwargs in logging_kwargs] == ["DEBUG"]
+    assert calls == ["run_bot"]
+
+
 def test_runtime_construction_uses_existing_telegram_token_alias() -> None:
     constructed_bots: list[dict[str, Any]] = []
 

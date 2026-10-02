@@ -416,10 +416,31 @@ def test_main_runs_run_bot_via_asyncio_run(monkeypatch: pytest.MonkeyPatch) -> N
         calls.append("run_bot")
 
     monkeypatch.setattr(bot_module, "run_bot", fake_run_bot)
+    monkeypatch.setattr(bot_module, "get_settings", lambda: _build_settings())
+    monkeypatch.setattr(bot_module.logging, "basicConfig", lambda **kwargs: None)
 
     bot_module.main()
 
     assert calls == ["run_bot"]
+
+
+def test_main_configures_logging_from_log_level_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logging_kwargs: list[dict[str, Any]] = []
+
+    async def fake_run_bot() -> None:
+        return None
+
+    monkeypatch.setattr(bot_module, "run_bot", fake_run_bot)
+    monkeypatch.setattr(bot_module, "get_settings", lambda: _build_settings(LOG_LEVEL="warning"))
+    monkeypatch.setattr(
+        bot_module.logging, "basicConfig", lambda **kwargs: logging_kwargs.append(kwargs)
+    )
+
+    bot_module.main()
+
+    assert [kwargs["level"] for kwargs in logging_kwargs] == ["WARNING"]
 
 
 def test_run_bot_does_not_log_the_telegram_token(

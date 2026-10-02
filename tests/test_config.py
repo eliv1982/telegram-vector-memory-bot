@@ -244,6 +244,14 @@ def test_log_level_is_normalized_to_uppercase(monkeypatch: pytest.MonkeyPatch) -
     assert settings.LOG_LEVEL == "DEBUG"
 
 
+@pytest.mark.parametrize("level", ["verbose", "TRACE", "10", ""])
+def test_invalid_log_level_rejected(monkeypatch: pytest.MonkeyPatch, level: str) -> None:
+    _set_required_env(monkeypatch, LOG_LEVEL=level)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
 def test_secret_str_fields_do_not_leak_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_required_env(monkeypatch)
 

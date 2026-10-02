@@ -1,4 +1,10 @@
-"""Run one live Stage 5 document RAG cycle and emit a safe JSON report."""
+"""Run one live document RAG cycle and emit a safe JSON report.
+
+This script makes REAL Pinecone and OpenAI-compatible API calls when executed and writes
+to (then removes from) the per-user document namespace of ``--user-id``. To avoid ever
+touching a real Telegram user's namespace, only a reserved synthetic user-ID block
+(900000000-999999999) is accepted, and the input must be a synthetic document.
+"""
 
 # ruff: noqa: E402
 
@@ -40,6 +46,13 @@ EXIT_INTERRUPTED = 130
 CLEANUP_POLL_INTERVAL_SECONDS = 0.5
 CLEANUP_TIMEOUT_SECONDS = 15.0
 
+# A reserved, clearly-synthetic Telegram user ID block (same one the memory smoke script
+# uses). Real Telegram user IDs in current use are well below this range, so rejecting
+# IDs outside of it is a practical (not foolproof) guard against pointing this script at
+# a real user's document namespace.
+_MIN_SYNTHETIC_USER_ID = 900000000
+_MAX_SYNTHETIC_USER_ID = 999999999
+
 
 class SmokeScriptError(Exception):
     """Raised for controlled smoke-test failures with safe public messages."""
@@ -66,11 +79,12 @@ class CleanupVerificationResult:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the CLI parser for the Stage 5 live smoke script."""
+    """Build the CLI parser for the live document RAG smoke script."""
     parser = argparse.ArgumentParser(
         description=(
-            "Run one live document RAG flow through the production Stage 5 "
-            "adapter, Pinecone document store, and OpenAI-compatible models."
+            "Run one live document RAG flow through the production Docling adapter, "
+            "Pinecone document store, and OpenAI-compatible models. Makes live API calls; "
+            "use only a synthetic document and a synthetic user ID."
         )
     )
     parser.add_argument(
@@ -88,8 +102,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--user-id",
         required=True,
-        type=_parse_positive_int,
-        help="Positive synthetic user ID used for the document namespace.",
+        type=_parse_synthetic_user_id,
+        help=(
+            "Synthetic user ID used for the document namespace "
+            f"(must be between {_MIN_SYNTHETIC_USER_ID} and {_MAX_SYNTHETIC_USER_ID}; "
+            "never a real Telegram user ID)."
+        ),
     )
     parser.add_argument(
         "--question",
@@ -191,6 +209,9 @@ def run_document_rag_smoke(
     cleanup_failure_message: str | None = None
 
     try:
+        # First, before any settings are loaded or client is created, so a non-synthetic ID
+        # can never reach Pinecone even when this function is called directly.
+        validate_synthetic_user_id(user_id)
         request = _build_request(file_path=file_path, content_type=content_type, user_id=user_id)
         processing_settings = processing_settings_factory()
         rag_settings = rag_settings_factory()
@@ -251,6 +272,20 @@ def run_document_rag_smoke(
                         )
         elif keep_records and inserted_document_ids:
             warnings.append("Inserted document IDs were kept by request.")
+        elif "document_store_factory" in locals() and not keep_records:
+            # No inserted IDs were reported, so exact-ID cleanup is impossible -- e.g. the
+            # run was interrupted mid-ingestion after some chunks were already written.
+            # The namespace belongs to a validated synthetic user, so purging all of it
+            # is safe and leaves nothing behind.
+            cleanup_attempted = True
+            try:
+                document_store_factory.delete_user_namespace(user_id)
+            except DocumentStoreError:
+                cleanup_succeeded = False
+                cleanup_failure_message = "Cleanup deletion failed."
+                warnings.append("Cleanup deletion failed.")
+            else:
+                cleanup_succeeded = True
 
     report = _build_report(
         status="success",
@@ -383,13 +418,28 @@ def _build_request(
     )
 
 
-def _parse_positive_int(value: str) -> int:
+def validate_synthetic_user_id(user_id: int) -> None:
+    """Reject IDs outside the reserved synthetic placeholder range."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int):
+        raise SmokeScriptError("user ID must be an integer")
+    if not (_MIN_SYNTHETIC_USER_ID <= user_id <= _MAX_SYNTHETIC_USER_ID):
+        raise SmokeScriptError(
+            "user ID does not look like a synthetic placeholder ID "
+            f"(expected a value between {_MIN_SYNTHETIC_USER_ID} and "
+            f"{_MAX_SYNTHETIC_USER_ID}); refusing to risk touching a real "
+            "Telegram user's namespace"
+        )
+
+
+def _parse_synthetic_user_id(value: str) -> int:
     try:
         parsed = int(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a positive integer") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    try:
+        validate_synthetic_user_id(parsed)
+    except SmokeScriptError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
     return parsed
 
 

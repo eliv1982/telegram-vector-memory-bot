@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "telegram-vector-memory-bot"
 version = "0.1.0"
-description = "Telegram bot with long-term vector memory in Pinecone, semantic deduplication, and per-user namespace isolation."
+description = "Telegram assistant with per-user vector memory and source-cited document RAG."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -39,10 +39,10 @@ packages = ["src/telegram_vector_memory_bot", "hay_v2_bot"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=telegram_vector_memory_bot --cov-report=term-missing"
+addopts = "--cov=telegram_vector_memory_bot --cov=hay_v2_bot --cov-report=term-missing"
 
 [tool.coverage.run]
-source = ["telegram_vector_memory_bot"]
+source = ["telegram_vector_memory_bot", "hay_v2_bot"]
 
 [tool.ruff]
 target-version = "py311"
