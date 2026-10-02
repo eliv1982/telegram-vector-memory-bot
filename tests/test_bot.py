@@ -177,25 +177,9 @@ class FakeMemoryService:
             raise self.raise_on_recall
         return self.recall_response
 
-    def remember(
-        self,
-        *,
-        user_id: int,
-        text: str,
-        username: str | None = None,
-        first_name: str | None = None,
-        last_name: str | None = None,
-    ) -> MemoryWriteResult:
+    def remember(self, *, user_id: int, text: str) -> MemoryWriteResult:
         self.events.append("remember")
-        self.remember_calls.append(
-            {
-                "user_id": user_id,
-                "text": text,
-                "username": username,
-                "first_name": first_name,
-                "last_name": last_name,
-            }
-        )
+        self.remember_calls.append({"user_id": user_id, "text": text})
         if self.raise_on_remember is not None:
             raise self.raise_on_remember
         return self.remember_response
@@ -280,13 +264,21 @@ class FakeTelegramSession(BaseSession):
         yield b""  # pragma: no cover -- keeps this an async generator function
 
 
+_GROUP_CHAT_ID = -1001234567890
+
+
 def _make_update(
-    *, text: str | None = None, photo: bool = False, user_id: int = 123
+    *,
+    text: str | None = None,
+    photo: bool = False,
+    user_id: int = 123,
+    chat_type: str = "private",
 ) -> dict[str, Any]:
+    chat_id = user_id if chat_type == "private" else _GROUP_CHAT_ID
     message: dict[str, Any] = {
         "message_id": 1,
         "date": int(time.time()),
-        "chat": {"id": user_id, "type": "private"},
+        "chat": {"id": chat_id, "type": chat_type},
         "from": {"id": user_id, "is_bot": False, "first_name": "Jane"},
     }
     if text is not None:
@@ -731,20 +723,17 @@ def test_successful_memory_write_logged_with_safe_fields_only(
     assert "mem-existing" not in caplog.text
 
 
-def test_optional_user_fields_none_forwarded_safely() -> None:
+def test_telegram_profile_fields_are_never_forwarded_to_remember() -> None:
     memory_service = FakeMemoryService()
     reply_service = FakeReplyService()
     message = FakeMessage(
         text="hi",
-        from_user=FakeUser(username=None, first_name=None, last_name=None),
+        from_user=FakeUser(id=42, username="jdoe", first_name="Jane", last_name="Doe"),
     )
 
     asyncio.run(bot_module.handle_text_message(message, memory_service, reply_service))
 
-    call = memory_service.remember_calls[0]
-    assert call["username"] is None
-    assert call["first_name"] is None
-    assert call["last_name"] is None
+    assert memory_service.remember_calls == [{"user_id": 42, "text": "hi"}]
 
 
 def test_bot_reply_text_never_passed_to_remember() -> None:
@@ -1045,6 +1034,66 @@ def test_dispatcher_slash_later_in_text_remains_ordinary_text() -> None:
     assert memory_service.recall_calls == [{"user_id": 123, "query": text, "top_k": None}]
     assert len(memory_service.remember_calls) == 1
     assert reply_service.generate_reply_calls[0]["user_text"] == text
+
+
+# ---------------------------------------------------------------------------
+# Private-chat-only routing (groups would expose a sender's private context)
+# ---------------------------------------------------------------------------
+
+_NON_PRIVATE_CHAT_TYPES = ["group", "supergroup", "channel"]
+
+
+@pytest.mark.parametrize("chat_type", _NON_PRIVATE_CHAT_TYPES)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hello there",
+        "/start",
+        "/help",
+        "/memory",
+        "/forget_me",
+        "/unknown",
+        f"/help@{_CURRENT_BOT_USERNAME}",
+        f"/memory@{_CURRENT_BOT_USERNAME}",
+        f"/forget_me@{_CURRENT_BOT_USERNAME}",
+        "расскажи про /help",
+    ],
+)
+def test_dispatcher_non_private_text_and_commands_reach_no_handler_or_service(
+    chat_type: str, text: str
+) -> None:
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
+
+    asyncio.run(
+        dispatcher.feed_raw_update(telegram_bot, _make_update(text=text, chat_type=chat_type))
+    )
+
+    _assert_fully_absorbed(session, memory_service, reply_service)
+
+
+@pytest.mark.parametrize("chat_type", _NON_PRIVATE_CHAT_TYPES)
+def test_dispatcher_non_private_non_text_message_reaches_no_handler(chat_type: str) -> None:
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
+
+    asyncio.run(
+        dispatcher.feed_raw_update(telegram_bot, _make_update(photo=True, chat_type=chat_type))
+    )
+
+    _assert_fully_absorbed(session, memory_service, reply_service)
+
+
+def test_dispatcher_private_chat_is_still_served_after_group_rejection() -> None:
+    telegram_bot, dispatcher, session, memory_service, reply_service = _build_harness()
+    reply_service.response = "a generated reply"
+
+    asyncio.run(
+        dispatcher.feed_raw_update(telegram_bot, _make_update(text="hi", chat_type="supergroup"))
+    )
+    asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="hi")))
+
+    assert session.sent_messages == [{"chat_id": 123, "text": "a generated reply"}]
+    assert memory_service.recall_calls == [{"user_id": 123, "query": "hi", "top_k": None}]
+    assert len(memory_service.remember_calls) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -196,6 +196,24 @@ class PineconeDocumentStoreFactory:
                 return
             raise DocumentCleanupError("Document cleanup failed") from exc
 
+    def delete_user_namespace(self, user_id: int) -> None:
+        """Delete every document chunk in one user's document namespace.
+
+        Never touches another namespace or the index itself. Idempotent: a
+        namespace that is already absent (Pinecone answers not-found for a
+        namespace with no data) counts as successfully deleted.
+        """
+        namespace = document_namespace_for_user(user_id)
+        try:
+            self._get_index_handle(self.describe_index()).delete(
+                delete_all=True,
+                namespace=namespace,
+            )
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                return
+            raise DocumentCleanupError("Document namespace cleanup failed") from exc
+
     def fetch_existing_document_ids(
         self,
         user_id: int,

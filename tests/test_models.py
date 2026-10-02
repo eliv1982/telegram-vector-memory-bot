@@ -128,9 +128,6 @@ def test_valid_memory_record() -> None:
         text="Remember to buy milk",
         content_hash="abc123",
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
-        username="jdoe",
-        first_name="Jane",
-        last_name="Doe",
     )
 
     assert record.user_id == 123
@@ -170,7 +167,7 @@ def test_memory_record_naive_datetime_rejected() -> None:
         )
 
 
-def test_memory_record_optional_telegram_fields_default_to_none() -> None:
+def test_memory_record_has_no_telegram_profile_fields() -> None:
     record = MemoryRecord(
         memory_id="mem-1",
         user_id=123,
@@ -179,9 +176,8 @@ def test_memory_record_optional_telegram_fields_default_to_none() -> None:
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
-    assert record.username is None
-    assert record.first_name is None
-    assert record.last_name is None
+    assert not {"username", "first_name", "last_name"} & set(MemoryRecord.model_fields)
+    assert not {"username", "first_name", "last_name"} & set(record.model_dump())
 
 
 def test_valid_index_info() -> None:
@@ -296,16 +292,13 @@ def test_valid_recalled_memory() -> None:
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
         source="telegram",
         content_hash="abc123",
-        username="jdoe",
-        first_name="Jane",
-        last_name="Doe",
     )
 
     assert memory.memory_id == "mem-1"
     assert memory.score == 0.95
 
 
-def test_recalled_memory_optional_telegram_fields_default_to_none() -> None:
+def test_recalled_memory_has_no_telegram_profile_fields() -> None:
     memory = RecalledMemory(
         memory_id="mem-1",
         text="Пиши мне кратко и по существу.",
@@ -315,9 +308,8 @@ def test_recalled_memory_optional_telegram_fields_default_to_none() -> None:
         content_hash="abc123",
     )
 
-    assert memory.username is None
-    assert memory.first_name is None
-    assert memory.last_name is None
+    assert not {"username", "first_name", "last_name"} & set(RecalledMemory.model_fields)
+    assert not {"username", "first_name", "last_name"} & set(memory.model_dump())
 
 
 @pytest.mark.parametrize("field", ["memory_id", "text", "source", "content_hash"])

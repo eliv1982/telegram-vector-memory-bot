@@ -180,6 +180,14 @@ def settings() -> Settings:
 
 @pytest.fixture
 def service(manager: FakeManager, settings: Settings) -> MemoryService:
+    """Default configuration: exact dedup only, semantic dedup disabled."""
+    return MemoryService(manager=manager, settings=settings, clock=_fixed_clock)
+
+
+@pytest.fixture
+def semantic_service(manager: FakeManager) -> MemoryService:
+    """Semantic dedup explicitly enabled (MEMORY_SEMANTIC_DEDUP_ENABLED=true)."""
+    settings = _build_settings(MEMORY_SEMANTIC_DEDUP_ENABLED=True)
     return MemoryService(manager=manager, settings=settings, clock=_fixed_clock)
 
 
@@ -263,9 +271,9 @@ def test_new_memory_creates_exactly_one_embedding(
 
 
 def test_new_memory_query_uses_exact_namespace_and_top_k_one(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
-    service.remember(user_id=7, text=SHORT_ANSWERS_RU)
+    semantic_service.remember(user_id=7, text=SHORT_ANSWERS_RU)
 
     assert len(manager.query_by_vector_calls) == 1
     call = manager.query_by_vector_calls[0]
@@ -275,9 +283,9 @@ def test_new_memory_query_uses_exact_namespace_and_top_k_one(
 
 
 def test_new_memory_upsert_reuses_same_embedding(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
-    service.remember(user_id=7, text=SHORT_ANSWERS_RU)
+    semantic_service.remember(user_id=7, text=SHORT_ANSWERS_RU)
 
     assert manager.upsert_calls[0]["values"] == DEFAULT_EMBEDDING
     assert manager.query_by_vector_calls[0]["values"] == DEFAULT_EMBEDDING
@@ -292,33 +300,21 @@ def test_new_memory_uses_deterministic_id(service: MemoryService, manager: FakeM
     assert manager.upsert_calls[0]["vector_id"] == expected_id
 
 
-def test_new_memory_safe_metadata_is_correct(service: MemoryService, manager: FakeManager) -> None:
-    policy = MemoryPolicy(0.90)
-
-    service.remember(
-        user_id=7,
-        text=SHORT_ANSWERS_RU,
-        username="jdoe",
-        first_name="Jane",
-        last_name=None,
-    )
-
-    metadata = manager.upsert_calls[0]["metadata"]
-    assert metadata["user_id"] == 7
-    assert metadata["text"] == SHORT_ANSWERS_RU
-    assert metadata["content_hash"] == policy.content_hash(SHORT_ANSWERS_RU)
-    assert metadata["source"] == "telegram"
-    assert metadata["record_type"] == "user_memory"
-    assert metadata["username"] == "jdoe"
-    assert metadata["first_name"] == "Jane"
-
-
-def test_new_memory_last_name_included_when_present(
+def test_new_memory_safe_metadata_is_exactly_the_expected_fixed_set(
     service: MemoryService, manager: FakeManager
 ) -> None:
-    service.remember(user_id=7, text=SHORT_ANSWERS_RU, last_name="Doe")
+    policy = MemoryPolicy(0.90)
 
-    assert manager.upsert_calls[0]["metadata"]["last_name"] == "Doe"
+    service.remember(user_id=7, text=SHORT_ANSWERS_RU)
+
+    assert manager.upsert_calls[0]["metadata"] == {
+        "user_id": 7,
+        "text": SHORT_ANSWERS_RU,
+        "content_hash": policy.content_hash(SHORT_ANSWERS_RU),
+        "created_at": "2026-01-01T12:00:00+00:00",
+        "source": "telegram",
+        "record_type": "user_memory",
+    }
 
 
 def test_new_memory_bot_response_is_absent(service: MemoryService, manager: FakeManager) -> None:
@@ -327,7 +323,7 @@ def test_new_memory_bot_response_is_absent(service: MemoryService, manager: Fake
     assert "bot_response" not in manager.upsert_calls[0]["metadata"]
 
 
-def test_new_memory_none_telegram_fields_are_omitted(
+def test_new_memory_never_persists_telegram_profile_fields(
     service: MemoryService, manager: FakeManager
 ) -> None:
     service.remember(user_id=7, text=SHORT_ANSWERS_RU)
@@ -338,15 +334,14 @@ def test_new_memory_none_telegram_fields_are_omitted(
     assert "last_name" not in metadata
 
 
-def test_new_memory_does_not_mutate_caller_supplied_strings(
-    service: MemoryService, manager: FakeManager
+@pytest.mark.parametrize("profile_field", ["username", "first_name", "last_name"])
+def test_remember_no_longer_accepts_telegram_profile_arguments(
+    service: MemoryService, manager: FakeManager, profile_field: str
 ) -> None:
-    username = "jdoe"
+    with pytest.raises(TypeError):
+        service.remember(user_id=7, text=SHORT_ANSWERS_RU, **{profile_field: "x"})
 
-    service.remember(user_id=7, text=SHORT_ANSWERS_RU, username=username)
-
-    assert username == "jdoe"
-    assert manager.upsert_calls[0]["metadata"]["username"] == "jdoe"
+    assert manager.upsert_calls == []
 
 
 def test_new_memory_created_at_is_utc_iso8601(
@@ -362,12 +357,14 @@ def test_new_memory_created_at_is_utc_iso8601(
 # ---------------------------------------------------------------------------
 
 
-def test_high_score_paraphrase_is_skipped(service: MemoryService, manager: FakeManager) -> None:
+def test_high_score_paraphrase_is_skipped(
+    semantic_service: MemoryService, manager: FakeManager
+) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.95, metadata={"text": BRIEF_RU})
     ]
 
-    result = service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
 
     assert result.action == MemoryAction.SKIPPED
     assert result.reason == MemoryReason.SEMANTIC_DUPLICATE
@@ -376,24 +373,26 @@ def test_high_score_paraphrase_is_skipped(service: MemoryService, manager: FakeM
     }
 
 
-def test_semantic_duplicate_does_not_upsert(service: MemoryService, manager: FakeManager) -> None:
-    manager.query_by_vector_response = [
-        VectorMatch(vector_id="mem-existing", score=0.95, metadata={"text": BRIEF_RU})
-    ]
-
-    service.remember(user_id=1, text=SHORT_ANSWERS_RU)
-
-    assert manager.upsert_calls == []
-
-
-def test_semantic_duplicate_returns_existing_id_and_score(
-    service: MemoryService, manager: FakeManager
+def test_semantic_duplicate_does_not_upsert(
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.95, metadata={"text": BRIEF_RU})
     ]
 
-    result = service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+    semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+
+    assert manager.upsert_calls == []
+
+
+def test_semantic_duplicate_returns_existing_id_and_score(
+    semantic_service: MemoryService, manager: FakeManager
+) -> None:
+    manager.query_by_vector_response = [
+        VectorMatch(vector_id="mem-existing", score=0.95, metadata={"text": BRIEF_RU})
+    ]
+
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
 
     assert result.existing_id == "mem-existing"
     assert result.similarity_score == 0.95
@@ -401,7 +400,7 @@ def test_semantic_duplicate_returns_existing_id_and_score(
 
 
 def test_semantic_duplicate_reads_candidate_text_from_metadata(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.95, metadata={"text": NO_MORE_SHORT_RU})
@@ -409,9 +408,127 @@ def test_semantic_duplicate_reads_candidate_text_from_metadata(
 
     # NO_MORE_SHORT_RU is negated, SHORT_ANSWERS_RU is not -> not a duplicate,
     # proving the candidate's *own* metadata text (not the new text) was used.
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+
+    assert result.action == MemoryAction.INSERTED
+
+
+# ---------------------------------------------------------------------------
+# Semantic dedup is opt-in (MEMORY_SEMANTIC_DEDUP_ENABLED, default False)
+# ---------------------------------------------------------------------------
+
+
+def test_semantic_dedup_is_off_in_default_test_settings(settings: Settings) -> None:
+    assert settings.MEMORY_SEMANTIC_DEDUP_ENABLED is False
+
+
+def test_exact_duplicate_is_still_skipped_when_semantic_dedup_disabled(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    memory_id = MemoryPolicy(0.90).memory_id_for_text(SHORT_ANSWERS_RU)
+    manager.fetch_response = {memory_id: {"values": DEFAULT_EMBEDDING, "metadata": {}}}
+
+    result = service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+
+    assert result.action == MemoryAction.SKIPPED
+    assert result.reason == MemoryReason.EXACT_DUPLICATE
+    assert result.existing_id == memory_id
+    assert manager.upsert_calls == []
+
+
+def test_exact_duplicate_with_different_case_and_spacing_still_skipped_when_disabled(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    # Exact dedup works on the normalized text, so case/whitespace variants collide.
+    memory_id = MemoryPolicy(0.90).memory_id_for_text(SHORT_ANSWERS_RU)
+    manager.fetch_response = {memory_id: {"values": DEFAULT_EMBEDDING, "metadata": {}}}
+
+    result = service.remember(user_id=1, text="  я   ПРЕДПОЧИТАЮ короткие ответы.  ")
+
+    assert result.reason == MemoryReason.EXACT_DUPLICATE
+    assert manager.upsert_calls == []
+
+
+def test_high_score_neighbour_does_not_discard_new_message_when_disabled(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    # A neighbour that would be a "semantic duplicate" if the feature were on.
+    manager.query_by_vector_response = [
+        VectorMatch(vector_id="mem-existing", score=0.99, metadata={"text": BRIEF_RU})
+    ]
+
     result = service.remember(user_id=1, text=SHORT_ANSWERS_RU)
 
     assert result.action == MemoryAction.INSERTED
+    assert result.reason == MemoryReason.NEW_MEMORY
+    assert len(manager.upsert_calls) == 1
+    assert manager.upsert_calls[0]["vector_id"] == result.memory_id
+    assert manager.upsert_calls[0]["vector_id"] != "mem-existing"
+
+
+def test_updated_fact_about_same_subject_is_stored_when_disabled(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    # The motivating case: a near-identical embedding for a fact that *changed*.
+    manager.query_by_vector_response = [
+        VectorMatch(vector_id="mem-berlin", score=0.97, metadata={"text": "I live in Berlin"})
+    ]
+
+    result = service.remember(user_id=1, text="I now live in Paris")
+
+    assert result.action == MemoryAction.INSERTED
+    assert manager.upsert_calls[0]["metadata"]["text"] == "I now live in Paris"
+
+
+def test_semantic_neighbour_is_not_even_queried_when_disabled(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+
+    assert manager.query_by_vector_calls == []
+    assert len(manager.upsert_calls) == 1
+
+
+def test_semantic_dedup_still_skips_paraphrase_when_explicitly_enabled(
+    semantic_service: MemoryService, manager: FakeManager
+) -> None:
+    manager.query_by_vector_response = [
+        VectorMatch(vector_id="mem-existing", score=0.99, metadata={"text": BRIEF_RU})
+    ]
+
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+
+    assert result.action == MemoryAction.SKIPPED
+    assert result.reason == MemoryReason.SEMANTIC_DUPLICATE
+    assert result.existing_id == "mem-existing"
+    assert len(manager.query_by_vector_calls) == 1
+    assert manager.upsert_calls == []
+
+
+def test_enabled_semantic_dedup_still_respects_similarity_threshold(
+    semantic_service: MemoryService, manager: FakeManager
+) -> None:
+    # Default threshold is unchanged (0.50): a score below it is never a duplicate.
+    manager.query_by_vector_response = [
+        VectorMatch(vector_id="mem-existing", score=0.49, metadata={"text": BRIEF_RU})
+    ]
+
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+
+    assert result.action == MemoryAction.INSERTED
+
+
+def test_enabled_semantic_dedup_negation_guard_uses_typographic_apostrophe(
+    semantic_service: MemoryService, manager: FakeManager
+) -> None:
+    manager.query_by_vector_response = [
+        VectorMatch(vector_id="mem-existing", score=0.99, metadata={"text": "I can eat peanuts."})
+    ]
+
+    result = semantic_service.remember(user_id=1, text="I can’t eat peanuts.")
+
+    assert result.action == MemoryAction.INSERTED
+    assert result.reason == MemoryReason.NEW_MEMORY
 
 
 # ---------------------------------------------------------------------------
@@ -420,13 +537,13 @@ def test_semantic_duplicate_reads_candidate_text_from_metadata(
 
 
 def test_negation_mismatch_inserts_new_memory_despite_high_score(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.99, metadata={"text": SHORT_ANSWERS_RU})
     ]
 
-    result = service.remember(user_id=1, text=NO_MORE_SHORT_RU)
+    result = semantic_service.remember(user_id=1, text=NO_MORE_SHORT_RU)
 
     assert result.action == MemoryAction.INSERTED
     assert result.reason == MemoryReason.NEW_MEMORY
@@ -436,13 +553,13 @@ def test_negation_mismatch_inserts_new_memory_despite_high_score(
 
 
 def test_negation_mismatch_never_updates_existing_candidate(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.99, metadata={"text": SHORT_ANSWERS_RU})
     ]
 
-    service.remember(user_id=1, text=NO_MORE_SHORT_RU)
+    semantic_service.remember(user_id=1, text=NO_MORE_SHORT_RU)
 
     assert len(manager.upsert_calls) == 1
     assert manager.upsert_calls[0]["vector_id"] != "mem-existing"
@@ -454,37 +571,37 @@ def test_negation_mismatch_never_updates_existing_candidate(
 
 
 def test_missing_candidate_text_inserts_conservatively(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.99, metadata={})
     ]
 
-    result = service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
 
     assert result.action == MemoryAction.INSERTED
 
 
 def test_non_string_candidate_text_inserts_conservatively(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.99, metadata={"text": 12345})
     ]
 
-    result = service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
 
     assert result.action == MemoryAction.INSERTED
 
 
 def test_empty_candidate_text_inserts_conservatively(
-    service: MemoryService, manager: FakeManager
+    semantic_service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_vector_response = [
         VectorMatch(vector_id="mem-existing", score=0.99, metadata={"text": "   "})
     ]
 
-    result = service.remember(user_id=1, text=SHORT_ANSWERS_RU)
+    result = semantic_service.remember(user_id=1, text=SHORT_ANSWERS_RU)
 
     assert result.action == MemoryAction.INSERTED
 
@@ -705,7 +822,46 @@ def test_recall_naive_timestamp_raises(service: MemoryService, manager: FakeMana
         service.recall(user_id=1, query="q")
 
 
-def test_recall_optional_telegram_metadata_may_be_absent(
+def test_recall_reads_historical_records_that_still_carry_profile_metadata(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    # Records written before profile fields were dropped still hold them in storage.
+    manager.query_by_text_response = [
+        VectorMatch(
+            vector_id="mem-old",
+            score=0.9,
+            metadata=_recalled_metadata(username="jdoe", first_name="Jane", last_name="Doe"),
+        )
+    ]
+
+    results = service.recall(user_id=1, query="q")
+
+    assert len(results) == 1
+    assert results[0].memory_id == "mem-old"
+    assert results[0].text == SHORT_ANSWERS_RU
+    dumped = results[0].model_dump()
+    assert "username" not in dumped
+    assert "first_name" not in dumped
+    assert "last_name" not in dumped
+
+
+def test_recall_tolerates_historical_profile_metadata_of_unexpected_type(
+    service: MemoryService, manager: FakeManager
+) -> None:
+    manager.query_by_text_response = [
+        VectorMatch(
+            vector_id="mem-old",
+            score=0.9,
+            metadata=_recalled_metadata(username=12345, first_name=None, last_name=["x"]),
+        )
+    ]
+
+    results = service.recall(user_id=1, query="q")
+
+    assert [r.memory_id for r in results] == ["mem-old"]
+
+
+def test_recall_works_for_new_records_without_profile_metadata(
     service: MemoryService, manager: FakeManager
 ) -> None:
     manager.query_by_text_response = [
@@ -714,9 +870,7 @@ def test_recall_optional_telegram_metadata_may_be_absent(
 
     results = service.recall(user_id=1, query="q")
 
-    assert results[0].username is None
-    assert results[0].first_name is None
-    assert results[0].last_name is None
+    assert [r.memory_id for r in results] == ["mem-1"]
 
 
 # ---------------------------------------------------------------------------

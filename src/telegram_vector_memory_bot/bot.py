@@ -16,6 +16,10 @@
 фрагменты ответа успешно отправлены; неудачная отправка выбрасывает
 исключение повторно, чтобы его обработал собственный error boundary aiogram,
 и ``remember`` при этом никогда не вызывается.
+
+Бот отвечает только в личных чатах: роутер целиком отфильтрован по типу чата,
+так что сообщения из групп, супергрупп и каналов не доходят ни до одного
+хендлера и ни до одного сервиса.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import re
 from typing import Final
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
@@ -268,9 +273,6 @@ async def handle_text_message(
         return
 
     user_id = from_user.id
-    username = from_user.username
-    first_name = from_user.first_name
-    last_name = from_user.last_name
 
     try:
         memories = await asyncio.to_thread(
@@ -306,9 +308,6 @@ async def handle_text_message(
             memory_service.remember,
             user_id=user_id,
             text=user_text,
-            username=username,
-            first_name=first_name,
-            last_name=last_name,
         )
     except (VectorMemoryError, MemoryServiceError) as exc:
         logger.warning("event=remember_failed error_type=%s", type(exc).__name__)
@@ -324,6 +323,12 @@ async def handle_text_message(
 
 def _build_router() -> Router:
     router = Router(name="stage5_router")
+
+    # Память привязана к from_user.id, но ответ в группе виден всем её участникам
+    # и мог бы раскрыть чужой приватный контекст. Поэтому весь роутер -- включая
+    # команды -- обслуживает только личные чаты; в остальных чатах обновление не
+    # попадает ни в один хендлер и ни в один сервис.
+    router.message.filter(F.chat.type == ChatType.PRIVATE)
 
     router.message.register(cmd_start, CommandStart())
     router.message.register(cmd_help, Command("help"))

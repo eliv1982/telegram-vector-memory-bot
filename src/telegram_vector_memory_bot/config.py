@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: SecretStr
 
     MEMORY_SIMILARITY_THRESHOLD: float = Field(default=0.50, ge=0.0, le=1.0)
+    # Semantic dedup silently discards a new message whose nearest neighbour scores above
+    # MEMORY_SIMILARITY_THRESHOLD. Cosine similarity cannot tell a paraphrase from an
+    # update ("I live in Berlin" vs "I now live in Paris"), so it is opt-in. Exact
+    # (normalized-text) dedup is always active regardless of this flag.
+    MEMORY_SEMANTIC_DEDUP_ENABLED: bool = False
     MEMORY_TOP_K: int = Field(default=5, ge=1, le=20)
     MEMORY_NAMESPACE_PREFIX: str = "telegram-user"
 

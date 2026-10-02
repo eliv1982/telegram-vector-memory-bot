@@ -57,6 +57,35 @@ def test_settings_created_from_environment(monkeypatch: pytest.MonkeyPatch) -> N
     assert settings.LOG_LEVEL == "INFO"
 
 
+def test_semantic_dedup_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.MEMORY_SEMANTIC_DEDUP_ENABLED is False
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("true", True), ("1", True), ("false", False)])
+def test_semantic_dedup_can_be_enabled_from_environment(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+) -> None:
+    _set_required_env(monkeypatch, MEMORY_SEMANTIC_DEDUP_ENABLED=raw)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.MEMORY_SEMANTIC_DEDUP_ENABLED is expected
+
+
+def test_semantic_dedup_enabling_does_not_change_similarity_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_required_env(monkeypatch, MEMORY_SEMANTIC_DEDUP_ENABLED="true")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.MEMORY_SIMILARITY_THRESHOLD == 0.50
+
+
 def test_missing_required_variable_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     for key, value in REQUIRED_ENV.items():
         if key == "OPENAI_CHAT_MODEL":

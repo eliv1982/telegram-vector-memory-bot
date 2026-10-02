@@ -57,9 +57,6 @@ def _memory(
     memory_id: str = "mem-1",
     text: str = "Я предпочитаю короткие ответы.",
     score: float = 0.9,
-    username: str | None = "jdoe",
-    first_name: str | None = "Jane",
-    last_name: str | None = "Doe",
 ) -> RecalledMemory:
     return RecalledMemory(
         memory_id=memory_id,
@@ -68,9 +65,6 @@ def _memory(
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
         source="telegram",
         content_hash="abc123",
-        username=username,
-        first_name=first_name,
-        last_name=last_name,
     )
 
 
@@ -261,9 +255,6 @@ def test_only_memory_text_included_no_metadata() -> None:
         memory_id="mem-secret-id",
         text="only this should appear",
         score=0.987654,
-        username="should-not-appear",
-        first_name="should-not-appear",
-        last_name="should-not-appear",
     )
 
     messages = build_messages(user_text="hi", memories=[memory])
@@ -271,7 +262,6 @@ def test_only_memory_text_included_no_metadata() -> None:
     full_prompt = json.dumps(messages, ensure_ascii=False)
     assert "only this should appear" in full_prompt
     assert "mem-secret-id" not in full_prompt
-    assert "should-not-appear" not in full_prompt
     assert "0.987654" not in full_prompt
     assert "abc123" not in full_prompt
     assert "2026-01-01" not in full_prompt

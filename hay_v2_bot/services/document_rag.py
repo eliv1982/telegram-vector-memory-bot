@@ -220,6 +220,14 @@ class DocumentRagService:
         except DocumentStoreError as exc:
             raise DocumentRagServiceError("Document cleanup failed") from exc
 
+    def delete_user_documents(self, user_id: int) -> None:
+        """Delete every stored document chunk of one user (their whole document namespace)."""
+        user_id = _validate_user_id(user_id)
+        try:
+            self._document_store_factory.delete_user_namespace(user_id)
+        except DocumentStoreError as exc:
+            raise DocumentRagServiceError("Document cleanup failed") from exc
+
 
 def _validate_user_id(user_id: int) -> int:
     if isinstance(user_id, bool) or not isinstance(user_id, int):

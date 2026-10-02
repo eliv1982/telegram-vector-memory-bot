@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Final
+from typing import Any, Final
 
 from aiogram import Dispatcher, F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from pydantic import ValidationError
@@ -114,19 +116,34 @@ async def cmd_memory(message: Message, memory_service: MemoryService) -> None:
     await _send_text_chunks(message, f"В памяти сохранено: {count} {_pluralize_records_ru(count)}.")
 
 
-async def cmd_forget_me(message: Message, memory_service: MemoryService) -> None:
+async def cmd_forget_me(
+    message: Message,
+    memory_service: MemoryService,
+    document_rag_service: DocumentRagService,
+) -> None:
     from_user = message.from_user
     if from_user is None:
         return
 
-    try:
-        await asyncio.to_thread(memory_service.forget_user, user_id=from_user.id)
-    except VectorMemoryError as exc:
-        _log_safe_warning("forget_me_failed", exc)
-        await _send_text_chunks(message, FORGET_ME_FAILURE_MESSAGE)
-        return
+    # The two namespaces are independent and a namespace deletion cannot be
+    # rolled back, so both are always attempted -- a failure of the first must
+    # not leave the second one's data behind. Full success is only reported
+    # when both succeeded.
+    memory_deleted = await _attempt_deletion(
+        "forget_me_memory_failed",
+        memory_service.forget_user,
+        user_id=from_user.id,
+    )
+    documents_deleted = await _attempt_deletion(
+        "forget_me_documents_failed",
+        document_rag_service.delete_user_documents,
+        from_user.id,
+    )
 
-    await _send_text_chunks(message, FORGET_ME_SUCCESS_MESSAGE)
+    if memory_deleted and documents_deleted:
+        await _send_text_chunks(message, FORGET_ME_SUCCESS_MESSAGE)
+    else:
+        await _send_text_chunks(message, FORGET_ME_FAILURE_MESSAGE)
 
 
 async def handle_unknown_command(message: Message) -> None:
@@ -206,9 +223,6 @@ async def handle_text_message(
         return
 
     user_id = from_user.id
-    username = from_user.username
-    first_name = from_user.first_name
-    last_name = from_user.last_name
 
     try:
         memories = await asyncio.to_thread(
@@ -240,9 +254,6 @@ async def handle_text_message(
             memory_service=memory_service,
             user_id=user_id,
             user_text=user_text,
-            username=username,
-            first_name=first_name,
-            last_name=last_name,
         )
         return
 
@@ -258,9 +269,6 @@ async def handle_text_message(
         memory_service=memory_service,
         user_id=user_id,
         user_text=user_text,
-        username=username,
-        first_name=first_name,
-        last_name=last_name,
     )
 
 
@@ -293,6 +301,11 @@ def register_handlers(dispatcher: Dispatcher) -> Dispatcher:
 
 def _build_router() -> Router:
     router = Router(name="hay_v2_bot_router")
+    # Memory and documents are isolated by from_user.id, but a reply in a group is
+    # visible to every member and could expose the sender's private context. The
+    # whole router -- commands and uploads included -- serves private chats only;
+    # in any other chat the update reaches no handler and no service.
+    router.message.filter(F.chat.type == ChatType.PRIVATE)
     router.message.register(cmd_start, CommandStart())
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_memory, Command("memory"))
@@ -324,21 +337,36 @@ async def _remember_user_message(
     memory_service: MemoryService,
     user_id: int,
     user_text: str,
-    username: str | None,
-    first_name: str | None,
-    last_name: str | None,
 ) -> None:
     try:
         await asyncio.to_thread(
             memory_service.remember,
             user_id=user_id,
             text=user_text,
-            username=username,
-            first_name=first_name,
-            last_name=last_name,
         )
     except (VectorMemoryError, MemoryServiceError) as exc:
         _log_safe_warning("remember_failed", exc)
+
+
+async def _attempt_deletion(
+    event: str,
+    delete: Callable[..., None],
+    *args: Any,
+    **kwargs: Any,
+) -> bool:
+    """Run one blocking deletion off the event loop; return False if it failed.
+
+    The broad ``except`` is deliberate: this is the only place a deletion error
+    is observed, and it must never stop the *other* store's deletion from being
+    attempted. Only the exception type is logged -- never its text, which could
+    carry namespaces, IDs, or provider details.
+    """
+    try:
+        await asyncio.to_thread(delete, *args, **kwargs)
+    except Exception as exc:
+        _log_safe_warning(event, exc)
+        return False
+    return True
 
 
 def _is_grounded_document_answer(answer: DocumentAnswer | None) -> bool:

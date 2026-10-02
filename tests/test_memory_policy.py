@@ -163,15 +163,84 @@ def test_english_standalone_negation_detected(policy: MemoryPolicy, text: str) -
 @pytest.mark.parametrize(
     "text",
     [
+        "I can't stand short answers.",
+        "She doesn't like coffee.",
+        "He didn't call me back.",
+        "I won't be there on Monday.",
+        "It isn't ready.",
+        "I haven't decided yet.",
+        "They aren't coming.",
+        "It wasn't me.",
+        "I wouldn't do that.",
+        "I shouldn't say.",
+        "DON'T shout.",
+    ],
+)
+def test_english_nt_contractions_detected(policy: MemoryPolicy, text: str) -> None:
+    assert policy.has_explicit_negation(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I can’t stand short answers.",  # U+2019 right single quotation mark
+        "She doesn’t like coffee.",
+        "I won‘t be there.",  # U+2018 left single quotation mark
+        "I don´t know.",  # U+00B4 acute accent
+        "I don`t know.",  # backtick
+        "I donʼt know.",  # U+02BC modifier letter apostrophe
+        "I don′t know.",  # U+2032 prime
+        "I don＇t know.",  # U+FF07 fullwidth apostrophe (folded by NFKC)
+        "DON’T shout.",
+    ],
+)
+def test_typographic_apostrophes_are_normalized_before_matching(
+    policy: MemoryPolicy, text: str
+) -> None:
+    assert policy.has_explicit_negation(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I cannot attend.",
+        "You CANNOT do that.",
+        "Так нельзя делать.",
+        "Нельзя опаздывать на встречи.",
+    ],
+)
+def test_cannot_and_russian_nelzya_detected(policy: MemoryPolicy, text: str) -> None:
+    assert policy.has_explicit_negation(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "недоделал проект вовремя",
         "nothing to see here",
         "know your limits",
         SHORT_ANSWERS_RU,
         BRIEF_RU,
+        "I live in Paris.",
+        "Мы можем встретиться завтра.",
+        "It's fine, she's here and they're ready.",  # apostrophes without a negation
+        "Beyond the cannon's range.",  # "cannon" must not match "cannot"
+        "О'Брайен любит чай.",
     ],
 )
 def test_negation_substrings_are_not_false_positives(policy: MemoryPolicy, text: str) -> None:
     assert policy.has_explicit_negation(text) is False
+
+
+def test_nt_contraction_mismatch_blocks_semantic_duplicate(policy: MemoryPolicy) -> None:
+    # "can’t" (typographic apostrophe) must register as negation so the guard still fires.
+    result = policy.is_semantic_duplicate(
+        new_text="I can’t eat peanuts.",
+        existing_text="I can eat peanuts.",
+        similarity_score=0.99,
+    )
+
+    assert result is False
 
 
 # ---------------------------------------------------------------------------

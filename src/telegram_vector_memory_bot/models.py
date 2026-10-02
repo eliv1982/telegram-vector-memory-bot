@@ -61,7 +61,11 @@ class MemoryWriteResult(BaseModel):
 
 
 class MemoryRecord(BaseModel):
-    """A single stored memory attributed to a Telegram user."""
+    """A single stored memory attributed to a Telegram user.
+
+    Carries no Telegram profile data (username / first name / last name):
+    identity is the numeric ``user_id`` only.
+    """
 
     memory_id: str
     user_id: int = Field(gt=0)
@@ -69,9 +73,6 @@ class MemoryRecord(BaseModel):
     content_hash: str
     created_at: datetime
     source: str = "telegram"
-    username: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
 
     @model_validator(mode="after")
     def _validate_record(self) -> MemoryRecord:
@@ -125,7 +126,10 @@ class RecalledMemory(BaseModel):
     """A single memory retrieved from the vector store for recall.
 
     Deliberately excludes any bot response text -- only user-provided
-    memories are ever recalled and surfaced back to the caller.
+    memories are ever recalled and surfaced back to the caller. Records
+    written before profile metadata was dropped may still carry
+    ``username`` / ``first_name`` / ``last_name`` in storage; those keys are
+    ignored when a stored match is parsed and never reach this model.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -136,9 +140,6 @@ class RecalledMemory(BaseModel):
     created_at: datetime
     source: str
     content_hash: str
-    username: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
 
     @model_validator(mode="after")
     def _validate_recalled_memory(self) -> RecalledMemory:

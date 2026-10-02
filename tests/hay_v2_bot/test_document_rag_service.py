@@ -19,9 +19,11 @@ from hay_v2_bot.services import (
     DocumentIngestionError,
     DocumentQuestionError,
     DocumentRagService,
+    DocumentRagServiceError,
     DocumentSummaryError,
 )
 from hay_v2_bot.storage import (
+    DocumentCleanupError,
     DocumentIndexUnavailableError,
     PineconeDocumentStoreFactory,
     document_namespace_for_user,
@@ -91,6 +93,8 @@ class FakeStoreFactory:
     def __init__(self) -> None:
         self.created_user_ids: list[int] = []
         self.delete_calls: list[tuple[int, tuple[str, ...]]] = []
+        self.delete_namespace_calls: list[int] = []
+        self.delete_namespace_exception: BaseException | None = None
         self.created_stores: dict[int, dict[str, object]] = {}
 
     def create_document_store(self, user_id: int) -> dict[str, object]:
@@ -105,6 +109,11 @@ class FakeStoreFactory:
     def delete_documents(self, user_id: int, document_ids: Sequence[str]) -> None:
         self.delete_calls.append((user_id, tuple(document_ids)))
 
+    def delete_user_namespace(self, user_id: int) -> None:
+        self.delete_namespace_calls.append(user_id)
+        if self.delete_namespace_exception is not None:
+            raise self.delete_namespace_exception
+
 
 class FakeNotFoundError(Exception):
     status_code = 404
@@ -113,10 +122,24 @@ class FakeNotFoundError(Exception):
 class FakePineconeIndex:
     def __init__(self, *, existing_ids: Sequence[str] = ()) -> None:
         self.delete_calls: list[dict[str, object]] = []
+        self.delete_all_calls: list[str] = []
+        self.delete_exception: BaseException | None = None
         self.fetch_calls: list[dict[str, object]] = []
         self.existing_ids = set(existing_ids)
 
-    def delete(self, *, ids: list[str] | None = None, namespace: str = "", **_: Any) -> None:
+    def delete(
+        self,
+        *,
+        ids: list[str] | None = None,
+        namespace: str = "",
+        delete_all: bool = False,
+        **_: Any,
+    ) -> None:
+        if self.delete_exception is not None:
+            raise self.delete_exception
+        if delete_all:
+            self.delete_all_calls.append(namespace)
+            return
         self.delete_calls.append({"ids": ids, "namespace": namespace})
         if ids is not None:
             for document_id in ids:
@@ -269,6 +292,84 @@ def test_pinecone_factory_delete_and_fetch_use_only_specified_ids() -> None:
         {"ids": ["doc-3", "doc-4"], "namespace": "telegram-documents-user-123"}
     ]
     assert remaining_ids == ("doc-3",)
+
+
+def test_pinecone_factory_delete_user_namespace_deletes_only_that_documents_namespace() -> None:
+    fake_index = FakePineconeIndex(existing_ids=("doc-1",))
+    fake_client = FakePineconeClient(index_handle=fake_index)
+    factory = PineconeDocumentStoreFactory(_rag_settings(), pinecone_client=fake_client)
+
+    factory.delete_user_namespace(123)
+
+    assert fake_index.delete_all_calls == ["telegram-documents-user-123"]
+    # No per-id deletion, no other namespace (notably not the v1 memory namespace).
+    assert fake_index.delete_calls == []
+    assert fake_client.create_index_calls == []
+
+
+def test_pinecone_factory_delete_user_namespace_uses_a_different_namespace_per_user() -> None:
+    fake_index = FakePineconeIndex()
+    factory = PineconeDocumentStoreFactory(
+        _rag_settings(), pinecone_client=FakePineconeClient(index_handle=fake_index)
+    )
+
+    factory.delete_user_namespace(123)
+    factory.delete_user_namespace(456)
+
+    assert fake_index.delete_all_calls == [
+        "telegram-documents-user-123",
+        "telegram-documents-user-456",
+    ]
+
+
+def test_pinecone_factory_delete_user_namespace_tolerates_missing_namespace() -> None:
+    fake_index = FakePineconeIndex()
+    fake_index.delete_exception = FakeNotFoundError("namespace not found")
+    factory = PineconeDocumentStoreFactory(
+        _rag_settings(), pinecone_client=FakePineconeClient(index_handle=fake_index)
+    )
+
+    factory.delete_user_namespace(123)  # must not raise: already absent == already deleted
+
+    assert fake_index.delete_all_calls == []
+
+
+def test_pinecone_factory_delete_user_namespace_failure_raises_safe_cleanup_error() -> None:
+    fake_index = FakePineconeIndex()
+    fake_index.delete_exception = RuntimeError("boom api-key=SECRET-123 host=internal.invalid")
+    factory = PineconeDocumentStoreFactory(
+        _rag_settings(), pinecone_client=FakePineconeClient(index_handle=fake_index)
+    )
+
+    with pytest.raises(DocumentCleanupError) as exc_info:
+        factory.delete_user_namespace(123)
+
+    assert "SECRET-123" not in str(exc_info.value)
+    assert "internal.invalid" not in str(exc_info.value)
+    assert "telegram-documents-user-123" not in str(exc_info.value)
+
+
+def test_pinecone_factory_delete_user_namespace_unavailable_index_raises_cleanup_error() -> None:
+    fake_client = FakePineconeClient(describe_exception=RuntimeError("index down"))
+    factory = PineconeDocumentStoreFactory(_rag_settings(), pinecone_client=fake_client)
+
+    with pytest.raises(DocumentCleanupError):
+        factory.delete_user_namespace(123)
+
+
+@pytest.mark.parametrize("user_id", [0, -5, True, "123", None])
+def test_pinecone_factory_delete_user_namespace_rejects_invalid_user_id_before_any_call(
+    user_id: object,
+) -> None:
+    fake_index = FakePineconeIndex()
+    fake_client = FakePineconeClient(index_handle=fake_index)
+    factory = PineconeDocumentStoreFactory(_rag_settings(), pinecone_client=fake_client)
+
+    with pytest.raises((TypeError, ValueError)):
+        factory.delete_user_namespace(user_id)
+
+    assert fake_index.delete_all_calls == []
+    assert fake_client.describe_calls == []
 
 
 def test_pinecone_factory_missing_index_raises_controlled_error() -> None:
@@ -656,3 +757,54 @@ def test_service_uses_another_store_for_another_user_and_delete_uses_only_specif
     assert store_factory.created_stores[123]["namespace"] == "telegram-documents-user-123"
     assert store_factory.created_stores[456]["namespace"] == "telegram-documents-user-456"
     assert store_factory.delete_calls == [(456, ("doc-7", "doc-8"))]
+
+
+def test_service_delete_user_documents_deletes_the_users_whole_document_namespace() -> None:
+    store_factory = FakeStoreFactory()
+    service = DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(),
+        document_store_factory=store_factory,
+    )
+
+    service.delete_user_documents(456)
+
+    assert store_factory.delete_namespace_calls == [456]
+    assert store_factory.delete_calls == []
+    assert store_factory.created_user_ids == []
+
+
+def test_service_delete_user_documents_wraps_store_failure_in_safe_service_error() -> None:
+    store_factory = FakeStoreFactory()
+    store_factory.delete_namespace_exception = DocumentCleanupError("raw provider detail 9999")
+    service = DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(),
+        document_store_factory=store_factory,
+    )
+
+    with pytest.raises(DocumentRagServiceError) as exc_info:
+        service.delete_user_documents(456)
+
+    assert str(exc_info.value) == "Document cleanup failed"
+    assert "9999" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("user_id", [0, -1, True, "7"])
+def test_service_delete_user_documents_rejects_invalid_user_id_before_store_call(
+    user_id: object,
+) -> None:
+    store_factory = FakeStoreFactory()
+    service = DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(),
+        document_store_factory=store_factory,
+    )
+
+    with pytest.raises(DocumentRagServiceError):
+        service.delete_user_documents(user_id)
+
+    assert store_factory.delete_namespace_calls == []

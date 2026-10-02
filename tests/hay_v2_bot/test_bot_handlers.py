@@ -19,7 +19,7 @@ from aiogram.types import Chat as AiogramChat
 from aiogram.types import Message as AiogramMessage
 from aiogram.types import User as AiogramUser
 from hay_v2_bot.bot import handlers, messages
-from hay_v2_bot.config import DocumentProcessingSettings
+from hay_v2_bot.config import DocumentProcessingSettings, DocumentRagSettings
 from hay_v2_bot.models import (
     DOCX_CONTENT_TYPE,
     PDF_CONTENT_TYPE,
@@ -27,7 +27,13 @@ from hay_v2_bot.models import (
     DocumentIngestionOutcome,
     DocumentSource,
 )
-from hay_v2_bot.services import DocumentIngestionError, DocumentQuestionError
+from hay_v2_bot.services import (
+    DocumentIngestionError,
+    DocumentQuestionError,
+    DocumentRagService,
+    DocumentRagServiceError,
+)
+from hay_v2_bot.storage import PineconeDocumentStoreFactory
 
 from telegram_vector_memory_bot.haystack_agent import HaystackAgentServiceError
 from telegram_vector_memory_bot.models import (
@@ -157,24 +163,8 @@ class FakeMemoryService:
             raise self.raise_on_recall
         return self.recall_response
 
-    def remember(
-        self,
-        *,
-        user_id: int,
-        text: str,
-        username: str | None = None,
-        first_name: str | None = None,
-        last_name: str | None = None,
-    ) -> MemoryWriteResult:
-        self.remember_calls.append(
-            {
-                "user_id": user_id,
-                "text": text,
-                "username": username,
-                "first_name": first_name,
-                "last_name": last_name,
-            }
-        )
+    def remember(self, *, user_id: int, text: str) -> MemoryWriteResult:
+        self.remember_calls.append({"user_id": user_id, "text": text})
         if self.raise_on_remember is not None:
             raise self.raise_on_remember
         return self.remember_response
@@ -221,6 +211,8 @@ class FakeDocumentRagService:
         self.events = events if events is not None else []
         self.ingest_calls: list[Any] = []
         self.answer_calls: list[dict[str, Any]] = []
+        self.delete_user_documents_calls: list[int] = []
+        self.delete_user_documents_exception: BaseException | None = None
         self.ingest_file_existed = False
         self.ingest_file_bytes: bytes | None = None
 
@@ -239,6 +231,11 @@ class FakeDocumentRagService:
         if self.answer_exception is not None:
             raise self.answer_exception
         return self.answer_result
+
+    def delete_user_documents(self, user_id: int) -> None:
+        self.delete_user_documents_calls.append(user_id)
+        if self.delete_user_documents_exception is not None:
+            raise self.delete_user_documents_exception
 
 
 class TrackingTemporaryDirectory(AbstractContextManager[str]):
@@ -349,13 +346,22 @@ def _fallback_answer() -> DocumentAnswer:
     )
 
 
+_GROUP_CHAT_ID = -1001234567890
+
+
 def _make_update(
-    *, text: str | None = None, photo: bool = False, user_id: int = 123
+    *,
+    text: str | None = None,
+    photo: bool = False,
+    document: bool = False,
+    user_id: int = 123,
+    chat_type: str = "private",
 ) -> dict[str, Any]:
+    chat_id = user_id if chat_type == "private" else _GROUP_CHAT_ID
     message: dict[str, Any] = {
         "message_id": 1,
         "date": int(time.time()),
-        "chat": {"id": user_id, "type": "private"},
+        "chat": {"id": chat_id, "type": chat_type},
         "from": {"id": user_id, "is_bot": False, "first_name": "Jane"},
     }
     if text is not None:
@@ -364,6 +370,14 @@ def _make_update(
         message["photo"] = [
             {"file_id": "abc", "file_unique_id": "abc-unique", "width": 90, "height": 90}
         ]
+    if document:
+        message["document"] = {
+            "file_id": "doc-file",
+            "file_unique_id": "doc-unique",
+            "file_name": "budget.pdf",
+            "mime_type": PDF_CONTENT_TYPE,
+            "file_size": 1024,
+        }
     return {"update_id": 1, "message": message}
 
 
@@ -703,15 +717,8 @@ def test_v1_memory_write_behavior_remains_active_for_ordinary_text() -> None:
         handlers.handle_text_message(message, memory_service, reply_service, document_service)
     )
 
-    assert memory_service.remember_calls == [
-        {
-            "user_id": 123,
-            "text": "Запомни, что я люблю горы.",
-            "username": "jdoe",
-            "first_name": "Jane",
-            "last_name": "Doe",
-        }
-    ]
+    # FakeUser carries a username/first/last name; none of it may reach memory.
+    assert memory_service.remember_calls == [{"user_id": 123, "text": "Запомни, что я люблю горы."}]
 
 
 @pytest.mark.parametrize("command_text", ["/start", "/help", "/memory", "/forget_me", "/unknown"])
@@ -851,3 +858,307 @@ def test_remember_failure_is_logged_safely(
 
     assert "event=remember_failed" in caplog.text
     assert "secret XYZ" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# /forget_me deletes BOTH user namespaces
+# ---------------------------------------------------------------------------
+
+
+def _run_forget_me(
+    memory_service: FakeMemoryService,
+    document_service: FakeDocumentRagService,
+) -> FakeMessage:
+    message = FakeMessage(text="/forget_me", from_user=FakeUser(id=123))
+    asyncio.run(handlers.cmd_forget_me(message, memory_service, document_service))
+    return message
+
+
+def test_forget_me_deletes_both_namespaces_and_reports_full_success() -> None:
+    memory_service = FakeMemoryService()
+    document_service = FakeDocumentRagService()
+
+    message = _run_forget_me(memory_service, document_service)
+
+    assert memory_service.forget_user_calls == [{"user_id": 123}]
+    assert document_service.delete_user_documents_calls == [123]
+    assert message.answer_calls == [messages.FORGET_ME_SUCCESS_MESSAGE]
+
+
+@pytest.mark.parametrize(
+    ("memory_exception", "documents_exception"),
+    [
+        pytest.param(None, DocumentRagServiceError("Document cleanup failed"), id="docs-fail"),
+        pytest.param(VectorStorageError("delete failed"), None, id="memory-fails"),
+        pytest.param(
+            VectorStorageError("delete failed"),
+            DocumentRagServiceError("Document cleanup failed"),
+            id="both-fail",
+        ),
+    ],
+)
+def test_forget_me_never_reports_success_when_either_deletion_fails(
+    memory_exception: Exception | None, documents_exception: Exception | None
+) -> None:
+    memory_service = FakeMemoryService()
+    memory_service.raise_on_forget_user = memory_exception
+    document_service = FakeDocumentRagService()
+    document_service.delete_user_documents_exception = documents_exception
+
+    message = _run_forget_me(memory_service, document_service)
+
+    assert message.answer_calls == [messages.FORGET_ME_FAILURE_MESSAGE]
+    assert messages.FORGET_ME_SUCCESS_MESSAGE not in message.answer_calls
+
+
+@pytest.mark.parametrize(
+    ("memory_exception", "documents_exception"),
+    [
+        pytest.param(None, DocumentRagServiceError("x"), id="docs-fail"),
+        pytest.param(VectorStorageError("x"), None, id="memory-fails"),
+        pytest.param(VectorStorageError("x"), DocumentRagServiceError("x"), id="both-fail"),
+        pytest.param(RuntimeError("unexpected"), None, id="memory-unexpected-error"),
+        pytest.param(None, RuntimeError("unexpected"), id="docs-unexpected-error"),
+    ],
+)
+def test_forget_me_attempts_both_deletions_even_when_one_fails(
+    memory_exception: Exception | None, documents_exception: Exception | None
+) -> None:
+    memory_service = FakeMemoryService()
+    memory_service.raise_on_forget_user = memory_exception
+    document_service = FakeDocumentRagService()
+    document_service.delete_user_documents_exception = documents_exception
+
+    _run_forget_me(memory_service, document_service)
+
+    assert memory_service.forget_user_calls == [{"user_id": 123}]
+    assert document_service.delete_user_documents_calls == [123]
+
+
+def test_forget_me_failure_reply_and_logs_expose_no_error_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "ns=telegram-documents-user-123 key=sk-SECRET host=pinecone.internal"
+    memory_service = FakeMemoryService()
+    memory_service.raise_on_forget_user = VectorStorageError(f"memory delete failed: {secret}")
+    document_service = FakeDocumentRagService()
+    document_service.delete_user_documents_exception = DocumentRagServiceError(
+        f"docs delete failed: {secret}"
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        message = _run_forget_me(memory_service, document_service)
+
+    assert message.answer_calls == [messages.FORGET_ME_FAILURE_MESSAGE]
+    sent = "\n".join(message.answer_calls)
+    for leaked in ("telegram-documents-user", "sk-SECRET", "pinecone.internal", "123"):
+        assert leaked not in sent
+    for leaked in ("telegram-documents-user", "sk-SECRET", "pinecone.internal", "delete failed"):
+        assert leaked not in caplog.text
+    assert "event=forget_me_memory_failed" in caplog.text
+    assert "error_type=VectorStorageError" in caplog.text
+    assert "event=forget_me_documents_failed" in caplog.text
+    assert "error_type=DocumentRagServiceError" in caplog.text
+
+
+def test_forget_me_failure_message_is_fixed_and_distinct_from_success() -> None:
+    assert messages.FORGET_ME_FAILURE_MESSAGE != messages.FORGET_ME_SUCCESS_MESSAGE
+    assert "/forget_me" in messages.FORGET_ME_FAILURE_MESSAGE
+    assert not any(ch.isdigit() for ch in messages.FORGET_ME_FAILURE_MESSAGE)
+
+
+def test_forget_me_without_from_user_calls_nothing() -> None:
+    memory_service = FakeMemoryService()
+    document_service = FakeDocumentRagService()
+    message = FakeMessage(text="/forget_me", from_user=None)
+
+    asyncio.run(handlers.cmd_forget_me(message, memory_service, document_service))
+
+    assert message.answer_calls == []
+    assert memory_service.forget_user_calls == []
+    assert document_service.delete_user_documents_calls == []
+
+
+def test_forget_me_runs_both_blocking_deletions_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    to_thread_calls: list[str] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        to_thread_calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(handlers.asyncio, "to_thread", fake_to_thread)
+
+    _run_forget_me(FakeMemoryService(), FakeDocumentRagService())
+
+    assert to_thread_calls == ["forget_user", "delete_user_documents"]
+
+
+class _AlreadyMissing(Exception):
+    status_code = 404
+
+
+class _MissingNamespaceIndex:
+    def __init__(self) -> None:
+        self.delete_calls: list[dict[str, Any]] = []
+
+    def delete(self, **kwargs: Any) -> None:
+        self.delete_calls.append(kwargs)
+        raise _AlreadyMissing("namespace not found")
+
+
+class _MissingNamespaceClient:
+    def __init__(self, index: _MissingNamespaceIndex) -> None:
+        self._index = index
+
+    def describe_index(self, name: str) -> dict[str, Any]:
+        return {
+            "name": name,
+            "host": "https://pinecone.invalid/index",
+            "dimension": 1536,
+            "metric": "cosine",
+            "status": {"ready": True, "state": "Ready"},
+        }
+
+    def Index(self, *, host: str = "", **_: Any) -> _MissingNamespaceIndex:
+        return self._index
+
+
+def test_forget_me_is_idempotent_when_document_namespace_is_already_missing() -> None:
+    # Real service + real store factory over a fake Pinecone that reports not-found.
+    index = _MissingNamespaceIndex()
+    rag_settings = DocumentRagSettings(
+        _env_file=None,
+        PINECONE_API_KEY="pinecone-key",
+        PINECONE_INDEX_NAME="document-index",
+        OPENAI_API_KEY="openai-key",
+        OPENAI_BASE_URL="https://example.invalid/v1",
+        OPENAI_EMBEDDING_MODEL="embedding-model",
+        OPENAI_CHAT_MODEL="chat-model",
+    )
+    factory = PineconeDocumentStoreFactory(
+        rag_settings, pinecone_client=_MissingNamespaceClient(index)
+    )
+    document_service = DocumentRagService(
+        _processing_settings(), rag_settings, adapter=object(), document_store_factory=factory
+    )
+    memory_service = FakeMemoryService()  # v1 manager already treats a missing namespace as done
+
+    message = FakeMessage(text="/forget_me", from_user=FakeUser(id=123))
+    asyncio.run(handlers.cmd_forget_me(message, memory_service, document_service))
+
+    assert index.delete_calls == [{"delete_all": True, "namespace": "telegram-documents-user-123"}]
+    assert message.answer_calls == [messages.FORGET_ME_SUCCESS_MESSAGE]
+
+
+def test_dispatcher_forget_me_in_private_chat_deletes_both_namespaces() -> None:
+    telegram_bot, dispatcher, session, memory_service, reply_service, document_service = (
+        _build_dispatcher_harness()
+    )
+
+    asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="/forget_me")))
+
+    assert memory_service.forget_user_calls == [{"user_id": 123}]
+    assert document_service.delete_user_documents_calls == [123]
+    assert session.sent_messages == [{"chat_id": 123, "text": messages.FORGET_ME_SUCCESS_MESSAGE}]
+
+
+# ---------------------------------------------------------------------------
+# Private-chat-only routing (groups would expose a sender's private context)
+# ---------------------------------------------------------------------------
+
+_NON_PRIVATE_CHAT_TYPES = ["group", "supergroup", "channel"]
+
+
+def _assert_no_handler_or_service_activity(
+    session: FakeTelegramSession,
+    memory_service: FakeMemoryService,
+    reply_service: FakeReplyService,
+    document_service: FakeDocumentRagService,
+) -> None:
+    assert session.sent_messages == []
+    assert memory_service.recall_calls == []
+    assert memory_service.remember_calls == []
+    assert memory_service.forget_user_calls == []
+    assert memory_service.get_memory_count_calls == []
+    assert reply_service.generate_reply_calls == []
+    assert document_service.answer_calls == []
+    assert document_service.ingest_calls == []
+    assert document_service.delete_user_documents_calls == []
+
+
+@pytest.mark.parametrize("chat_type", _NON_PRIVATE_CHAT_TYPES)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Какой бюджет Orion?",
+        "/start",
+        "/help",
+        "/memory",
+        "/forget_me",
+        "/unknown",
+        f"/help@{_CURRENT_BOT_USERNAME}",
+        f"/memory@{_CURRENT_BOT_USERNAME}",
+        f"/forget_me@{_CURRENT_BOT_USERNAME}",
+        "расскажи про /help",
+    ],
+)
+def test_dispatcher_non_private_text_and_commands_reach_no_handler_or_service(
+    chat_type: str, text: str
+) -> None:
+    telegram_bot, dispatcher, session, memory_service, reply_service, document_service = (
+        _build_dispatcher_harness()
+    )
+    document_service.answer_result = _grounded_answer()  # would be served if routing leaked
+
+    asyncio.run(
+        dispatcher.feed_raw_update(telegram_bot, _make_update(text=text, chat_type=chat_type))
+    )
+
+    _assert_no_handler_or_service_activity(session, memory_service, reply_service, document_service)
+
+
+@pytest.mark.parametrize("chat_type", _NON_PRIVATE_CHAT_TYPES)
+def test_dispatcher_non_private_non_text_message_reaches_no_handler(chat_type: str) -> None:
+    telegram_bot, dispatcher, session, memory_service, reply_service, document_service = (
+        _build_dispatcher_harness()
+    )
+
+    asyncio.run(
+        dispatcher.feed_raw_update(telegram_bot, _make_update(photo=True, chat_type=chat_type))
+    )
+
+    _assert_no_handler_or_service_activity(session, memory_service, reply_service, document_service)
+
+
+@pytest.mark.parametrize("chat_type", _NON_PRIVATE_CHAT_TYPES)
+def test_dispatcher_non_private_document_upload_reaches_no_handler_or_service(
+    chat_type: str,
+) -> None:
+    # An upload in a group must not be downloaded, ingested, or stored under the sender.
+    telegram_bot, dispatcher, session, memory_service, reply_service, document_service = (
+        _build_dispatcher_harness()
+    )
+
+    asyncio.run(
+        dispatcher.feed_raw_update(telegram_bot, _make_update(document=True, chat_type=chat_type))
+    )
+
+    _assert_no_handler_or_service_activity(session, memory_service, reply_service, document_service)
+
+
+def test_dispatcher_private_chat_is_still_served_after_group_rejection() -> None:
+    telegram_bot, dispatcher, session, memory_service, reply_service, document_service = (
+        _build_dispatcher_harness()
+    )
+
+    asyncio.run(
+        dispatcher.feed_raw_update(telegram_bot, _make_update(text="hi", chat_type="supergroup"))
+    )
+    asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(text="hi")))
+
+    assert session.sent_messages == [{"chat_id": 123, "text": "generated reply"}]
+    assert memory_service.recall_calls == [{"user_id": 123, "query": "hi", "top_k": None}]
+    assert document_service.answer_calls == [{"user_id": 123, "question": "hi"}]
+    assert len(memory_service.remember_calls) == 1

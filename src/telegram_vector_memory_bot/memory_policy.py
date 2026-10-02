@@ -18,11 +18,28 @@ _NAMESPACE_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
+# Typographic apostrophe/quote variants folded to ASCII "'" so "don’t" and "don't"
+# match the same way. Applied *before* NFKC: NFKC would turn U+00B4 into a space
+# plus a combining accent and break the contraction.
+_APOSTROPHE_TRANSLATION = str.maketrans(
+    {
+        "\u2018": "'",  # left single quotation mark
+        "\u2019": "'",  # right single quotation mark (the usual typographic apostrophe)
+        "\u201b": "'",  # single high-reversed-9 quotation mark
+        "\u02bc": "'",  # modifier letter apostrophe
+        "\u2032": "'",  # prime
+        "\u00b4": "'",  # acute accent
+        "`": "'",  # grave accent, commonly typed instead of an apostrophe
+    }
+)
+
 # Small, fixed list of standalone RU/EN negation tokens and phrases. Matched at
 # word boundaries so substrings inside unrelated words never count (e.g. the
-# "не" in "недоделал" or the "not" in "nothing" do not match).
+# "не" in "недоделал" or the "not" in "nothing" do not match). ``[a-z]+n't``
+# covers the English "n't" contractions (don't, doesn't, can't, won't, isn't,
+# haven't, ...); apostrophes are normalized to "'" before matching.
 _NEGATION_PATTERN = re.compile(
-    r"\b(?:не|нет|никогда|больше\s+не|not|no|never|do\s+not|don't)\b",
+    r"\b(?:не|нет|нельзя|никогда|больше\s+не|not|no|never|cannot|do\s+not|[a-z]+n't)\b",
     re.IGNORECASE,
 )
 
@@ -83,12 +100,14 @@ class MemoryPolicy:
         This is a small, deliberately limited heuristic, not a full
         contradiction detector: it only recognizes a fixed list of common
         negation words/phrases at word boundaries (RU: "не", "нет",
-        "никогда", "больше не"; EN: "not", "no", "never", "don't",
-        "do not"). It will miss implicit or indirect negation such as
+        "нельзя", "никогда", "больше не"; EN: "not", "no", "never",
+        "cannot", "do not", and any "n't" contraction such as "don't",
+        "can't", "won't"). Typographic apostrophes ("don’t") are treated like
+        the ASCII one. It will miss implicit or indirect negation such as
         "I changed my mind" or "that's no longer true", and it does not
         reason about sentence structure or grammatical scope.
         """
-        normalized = unicodedata.normalize("NFKC", text)
+        normalized = unicodedata.normalize("NFKC", text.translate(_APOSTROPHE_TRANSLATION))
         return _NEGATION_PATTERN.search(normalized) is not None
 
     def is_semantic_duplicate(

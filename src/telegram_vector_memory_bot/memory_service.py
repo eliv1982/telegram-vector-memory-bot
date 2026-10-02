@@ -77,16 +77,14 @@ class MemoryService:
             prefix=self._settings.MEMORY_NAMESPACE_PREFIX, user_id=user_id
         )
 
-    def remember(
-        self,
-        *,
-        user_id: int,
-        text: str,
-        username: str | None = None,
-        first_name: str | None = None,
-        last_name: str | None = None,
-    ) -> MemoryWriteResult:
-        """Store *text* as a memory for *user_id*, deduplicating along the way."""
+    def remember(self, *, user_id: int, text: str) -> MemoryWriteResult:
+        """Store *text* as a memory for *user_id*.
+
+        An exact duplicate (same normalized text) is always skipped. A
+        semantic duplicate is skipped only when
+        ``Settings.MEMORY_SEMANTIC_DEDUP_ENABLED`` is true; by default any
+        non-exact message is stored.
+        """
         if user_id <= 0:
             raise ValueError("user_id must be positive")
         if not text.strip():
@@ -108,17 +106,20 @@ class MemoryService:
 
         embedding = self._manager.create_embedding(text)
 
-        matches = self._manager.query_by_vector(
-            values=embedding,
-            namespace=namespace,
-            top_k=1,
-            metadata_filter=_RECORD_TYPE_FILTER,
-        )
+        if self._settings.MEMORY_SEMANTIC_DEDUP_ENABLED:
+            matches = self._manager.query_by_vector(
+                values=embedding,
+                namespace=namespace,
+                top_k=1,
+                metadata_filter=_RECORD_TYPE_FILTER,
+            )
 
-        if matches:
-            duplicate_result = self._check_semantic_duplicate(new_text=text, candidate=matches[0])
-            if duplicate_result is not None:
-                return duplicate_result
+            if matches:
+                duplicate_result = self._check_semantic_duplicate(
+                    new_text=text, candidate=matches[0]
+                )
+                if duplicate_result is not None:
+                    return duplicate_result
 
         created_at = self._clock()
         if created_at.tzinfo is None:
@@ -130,9 +131,6 @@ class MemoryService:
             text=text,
             content_hash=content_hash,
             created_at=created_at,
-            username=username,
-            first_name=first_name,
-            last_name=last_name,
         )
 
         metadata = _build_metadata(record)
@@ -227,7 +225,7 @@ def _build_metadata(record: MemoryRecord) -> dict[str, Any]:
     Only a fixed, known-safe set of fields is stored: no bot responses, API
     keys, tokens, full Telegram update objects, prompts, or chat history.
     """
-    metadata: dict[str, Any] = {
+    return {
         "user_id": record.user_id,
         "text": record.text,
         "content_hash": record.content_hash,
@@ -235,13 +233,6 @@ def _build_metadata(record: MemoryRecord) -> dict[str, Any]:
         "source": record.source,
         "record_type": _RECORD_TYPE,
     }
-    if record.username is not None:
-        metadata["username"] = record.username
-    if record.first_name is not None:
-        metadata["first_name"] = record.first_name
-    if record.last_name is not None:
-        metadata["last_name"] = record.last_name
-    return metadata
 
 
 def _require_metadata_str(metadata: dict[str, Any], field_name: str) -> str:
@@ -272,10 +263,6 @@ def _parse_recalled_memory(match: VectorMatch) -> RecalledMemory:
     if created_at.tzinfo is None:
         raise StoredMemoryFormatError("stored memory 'created_at' must be timezone-aware")
 
-    username = metadata.get("username")
-    first_name = metadata.get("first_name")
-    last_name = metadata.get("last_name")
-
     try:
         return RecalledMemory(
             memory_id=match.vector_id,
@@ -284,9 +271,6 @@ def _parse_recalled_memory(match: VectorMatch) -> RecalledMemory:
             created_at=created_at,
             source=source,
             content_hash=content_hash,
-            username=username if isinstance(username, str) else None,
-            first_name=first_name if isinstance(first_name, str) else None,
-            last_name=last_name if isinstance(last_name, str) else None,
         )
     except ValidationError as exc:
         raise StoredMemoryFormatError("stored memory failed validation") from exc

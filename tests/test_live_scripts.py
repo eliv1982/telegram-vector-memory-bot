@@ -904,7 +904,7 @@ def test_smoke_test_semantic_paraphrase_reported_without_mandatory_failure_by_de
 
 def test_smoke_test_require_semantic_skip_succeeds_when_skipped() -> None:
     ns = _load_script("smoke_test_memory.py")
-    settings = _build_settings()
+    settings = _build_settings(MEMORY_SEMANTIC_DEDUP_ENABLED=True)
     embeddings = _default_smoke_embeddings(ns)
     embeddings[ns["PARAPHRASE_TEXT"]] = [0.99, 0.14, 0.0, 0.0]  # high similarity -> duplicate
     manager = InMemoryFakeManager(embeddings)
@@ -932,7 +932,7 @@ def test_smoke_test_require_semantic_skip_fails_when_not_skipped() -> None:
 
 def test_smoke_test_final_cleanup_always_runs_after_failure() -> None:
     ns = _load_script("smoke_test_memory.py")
-    settings = _build_settings()
+    settings = _build_settings(MEMORY_SEMANTIC_DEDUP_ENABLED=True)
     embeddings = _default_smoke_embeddings(ns)
     # Deliberately identical to the first memory -> triggers a semantic-duplicate
     # failure on the "different memory must be inserted" assertion.
@@ -982,7 +982,7 @@ def test_smoke_test_main_rejects_invalid_user_id_without_manager_calls() -> None
 
 def test_smoke_test_main_returns_nonzero_on_failure() -> None:
     ns = _load_script("smoke_test_memory.py")
-    settings = _build_settings()
+    settings = _build_settings(MEMORY_SEMANTIC_DEDUP_ENABLED=True)
     embeddings = _default_smoke_embeddings(ns)
     embeddings[ns["DIFFERENT_MEMORY_TEXT"]] = [1.0, 0.0, 0.0, 0.0]
     manager = InMemoryFakeManager(embeddings)
@@ -1465,7 +1465,7 @@ def test_smoke_query_visibility_confirmed_before_paraphrase_processing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ns = _load_script("smoke_test_memory.py")
-    settings = _build_settings()
+    settings = _build_settings(MEMORY_SEMANTIC_DEDUP_ENABLED=True)
     # 1 call is "free" (remember(first_write)'s own duplicate-check query, which
     # is legitimately empty since nothing is stored yet); the next 2 are the
     # forced-empty attempts this test actually exercises.
