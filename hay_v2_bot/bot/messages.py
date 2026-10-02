@@ -40,6 +40,10 @@ UPLOAD_STARTED_MESSAGE = (
 UPLOAD_COMPLETED_MESSAGE = "Готово. Я изучил этот файл, теперь можем его обсудить."
 UNSUPPORTED_DOCUMENT_MESSAGE = "Поддерживаются только документы PDF и DOCX."
 PROCESSING_FAILURE_MESSAGE = "Не удалось обработать файл. Попробуйте ещё раз позже."
+# Sent when the file was indexed but only the optional one-sentence summary failed.
+SUMMARY_UNAVAILABLE_MESSAGE = (
+    "Файл сохранён, и по нему можно задавать вопросы, но краткое резюме подготовить не удалось."
+)
 
 _SOURCE_BLOCK_TITLE = "Источники:"
 _MAX_DISPLAYED_SOURCES = 2
@@ -134,6 +138,7 @@ __all__ = [
     "NON_TEXT_MESSAGE",
     "PROCESSING_FAILURE_MESSAGE",
     "START_MESSAGE",
+    "SUMMARY_UNAVAILABLE_MESSAGE",
     "UNKNOWN_COMMAND_MESSAGE",
     "UNSUPPORTED_DOCUMENT_MESSAGE",
     "UPLOAD_COMPLETED_MESSAGE",

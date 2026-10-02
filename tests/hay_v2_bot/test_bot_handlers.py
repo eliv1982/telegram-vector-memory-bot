@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import time
@@ -12,16 +13,25 @@ from pathlib import Path
 from typing import Any
 
 import aiogram
+import aiohttp
 import pytest
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import GetMe, SendMessage
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
+from aiogram.methods import GetFile, GetMe, SendMessage
 from aiogram.types import Chat as AiogramChat
+from aiogram.types import File as AiogramFile
 from aiogram.types import Message as AiogramMessage
 from aiogram.types import User as AiogramUser
 from hay_v2_bot.bot import handlers, messages
 from hay_v2_bot.config import DocumentProcessingSettings, DocumentRagSettings
 from hay_v2_bot.models import (
     DOCX_CONTENT_TYPE,
+    INSUFFICIENT_DOCUMENT_ANSWER,
     PDF_CONTENT_TYPE,
     DocumentAnswer,
     DocumentIngestionOutcome,
@@ -32,8 +42,13 @@ from hay_v2_bot.services import (
     DocumentQuestionError,
     DocumentRagService,
     DocumentRagServiceError,
+    DocumentSummaryError,
 )
 from hay_v2_bot.storage import PineconeDocumentStoreFactory
+from haystack import Document
+from haystack.dataclasses import ChatMessage
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 from telegram_vector_memory_bot.haystack_agent import HaystackAgentServiceError
 from telegram_vector_memory_bot.models import (
@@ -258,6 +273,10 @@ class FakeTelegramSession(BaseSession):
         super().__init__()
         self.sent_messages: list[dict[str, Any]] = []
         self._next_message_id = 1
+        # Real aiogram download path: bot.download() -> get_file() -> stream_content().
+        self.get_file_exception: BaseException | None = None
+        self.stream_exception: BaseException | None = None
+        self.file_bytes = b"%PDF-1.7\ncontent"
 
     async def make_request(self, bot: Any, method: Any, timeout: float | None = None) -> Any:
         if isinstance(method, GetMe):
@@ -266,6 +285,14 @@ class FakeTelegramSession(BaseSession):
                 is_bot=True,
                 first_name="Test Bot",
                 username=_CURRENT_BOT_USERNAME,
+            )
+        if isinstance(method, GetFile):
+            if self.get_file_exception is not None:
+                raise self.get_file_exception
+            return AiogramFile(
+                file_id=method.file_id,
+                file_unique_id="doc-unique",
+                file_path="documents/file.pdf",
             )
         if isinstance(method, SendMessage):
             message_id = self._next_message_id
@@ -290,8 +317,9 @@ class FakeTelegramSession(BaseSession):
         chunk_size: int = 65536,
         raise_for_status: bool = True,
     ) -> Any:
-        raise NotImplementedError("not used in offline tests")
-        yield b""
+        if self.stream_exception is not None:
+            raise self.stream_exception
+        yield self.file_bytes
 
 
 def _processing_settings(**overrides: Any) -> DocumentProcessingSettings:
@@ -1161,4 +1189,593 @@ def test_dispatcher_private_chat_is_still_served_after_group_rejection() -> None
     assert session.sent_messages == [{"chat_id": 123, "text": "generated reply"}]
     assert memory_service.recall_calls == [{"user_id": 123, "query": "hi", "top_k": None}]
     assert document_service.answer_calls == [{"user_id": 123, "question": "hi"}]
+    assert len(memory_service.remember_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Upload failure semantics
+# ---------------------------------------------------------------------------
+
+_SECRET_HOST = "secret-host.internal"
+_TOKEN_URL = f"https://api.telegram.org/file/bot{FAKE_TOKEN}/documents/file.pdf"
+
+
+def _get_file_method() -> GetFile:
+    return GetFile(file_id="doc-file")
+
+
+def _client_response_error() -> aiohttp.ClientResponseError:
+    request_info = aiohttp.RequestInfo(
+        url=URL(_TOKEN_URL),
+        method="GET",
+        headers=CIMultiDictProxy(CIMultiDict()),
+        real_url=URL(_TOKEN_URL),
+    )
+    return aiohttp.ClientResponseError(request_info, (), status=404, message="Not Found")
+
+
+# Raised by Bot.get_file() through aiogram's request layer.
+_TELEGRAM_API_FAILURES = [
+    pytest.param(
+        lambda: TelegramNetworkError(
+            method=_get_file_method(), message=f"Cannot connect to {_SECRET_HOST}"
+        ),
+        id="network",
+    ),
+    pytest.param(
+        lambda: TelegramBadRequest(
+            method=_get_file_method(), message="Bad Request: file is too big"
+        ),
+        id="bad-request",
+    ),
+    pytest.param(
+        lambda: TelegramServerError(method=_get_file_method(), message="Bad Gateway"),
+        id="server-error",
+    ),
+    pytest.param(
+        lambda: TelegramRetryAfter(
+            method=_get_file_method(), message="Flood control", retry_after=30
+        ),
+        id="retry-after",
+    ),
+]
+
+# Raised while streaming the file body: aiogram does not wrap these.
+_FILE_STREAM_FAILURES = [
+    pytest.param(_client_response_error, id="client-response-error"),
+    pytest.param(
+        lambda: aiohttp.ClientPayloadError(f"payload broken at {_SECRET_HOST}"), id="payload-error"
+    ),
+    pytest.param(lambda: aiohttp.ServerDisconnectedError(), id="server-disconnected"),
+    pytest.param(lambda: aiohttp.ClientConnectionError(_SECRET_HOST), id="connection-error"),
+    pytest.param(lambda: TimeoutError(), id="timeout"),
+    pytest.param(lambda: OSError(f"disk or socket error at {_SECRET_HOST}"), id="os-error"),
+]
+
+_ALL_DOWNLOAD_FAILURES = [*_TELEGRAM_API_FAILURES, *_FILE_STREAM_FAILURES]
+
+
+def _assert_reply_has_no_internal_details(replies: list[str], log_text: str) -> None:
+    for leaked in (_SECRET_HOST, FAKE_TOKEN, "api.telegram.org", "Bad Request", "Traceback"):
+        assert all(leaked not in reply for reply in replies)
+        assert leaked not in log_text
+
+
+@pytest.mark.parametrize("make_exception", _ALL_DOWNLOAD_FAILURES)
+def test_download_failure_gets_one_fixed_failure_reply_and_never_ends_silently(
+    make_exception: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    document_service = FakeDocumentRagService()
+    message = FakeMessage(
+        document=FakeDocument(),
+        from_user=FakeUser(),
+        bot=FakeTelegramBot(exception=make_exception()),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    assert message.answer_calls == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.PROCESSING_FAILURE_MESSAGE,
+    ]
+    assert messages.UPLOAD_COMPLETED_MESSAGE not in message.answer_calls
+    assert document_service.ingest_calls == []
+    assert "event=document_upload_failed" in caplog.text
+    _assert_reply_has_no_internal_details(message.answer_calls, caplog.text)
+
+
+@pytest.mark.parametrize("make_exception", _TELEGRAM_API_FAILURES)
+def test_dispatcher_real_get_file_failure_gets_a_failure_reply(make_exception: Any) -> None:
+    # Drives the real aiogram Bot.download(): GetFile is made to fail inside the request layer.
+    telegram_bot, dispatcher, session, memory_service, _, document_service = (
+        _build_dispatcher_harness()
+    )
+    session.get_file_exception = make_exception()
+
+    asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(document=True)))
+
+    assert [sent["text"] for sent in session.sent_messages] == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.PROCESSING_FAILURE_MESSAGE,
+    ]
+    assert document_service.ingest_calls == []
+    assert memory_service.remember_calls == []
+
+
+@pytest.mark.parametrize("make_exception", _FILE_STREAM_FAILURES)
+def test_dispatcher_real_file_stream_failure_gets_a_failure_reply(
+    make_exception: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # get_file succeeds; the streamed body then fails with a raw (unwrapped) aiohttp error.
+    telegram_bot, dispatcher, session, _, _, document_service = _build_dispatcher_harness()
+    session.stream_exception = make_exception()
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(document=True)))
+
+    replies = [sent["text"] for sent in session.sent_messages]
+    assert replies == [messages.UPLOAD_STARTED_MESSAGE, messages.PROCESSING_FAILURE_MESSAGE]
+    assert document_service.ingest_calls == []
+    _assert_reply_has_no_internal_details(replies, caplog.text)
+
+
+def test_dispatcher_real_download_success_path_is_unchanged() -> None:
+    telegram_bot, dispatcher, session, _, _, document_service = _build_dispatcher_harness()
+    session.file_bytes = b"%PDF-1.7\nreal downloaded bytes"
+
+    asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(document=True)))
+
+    assert [sent["text"] for sent in session.sent_messages] == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.UPLOAD_COMPLETED_MESSAGE,
+        "В документе описан бюджет пилота Orion.",
+    ]
+    assert document_service.ingest_file_bytes == b"%PDF-1.7\nreal downloaded bytes"
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        pytest.param(DocumentIngestionError("raw provider detail user 123"), id="ingestion"),
+        pytest.param(DocumentRagServiceError("raw provider detail user 123"), id="service"),
+        pytest.param(OSError("C:/secret/path/file.pdf"), id="os-error"),
+    ],
+)
+def test_ingestion_failure_gets_one_fixed_failure_reply(
+    exception: BaseException, caplog: pytest.LogCaptureFixture
+) -> None:
+    document_service = FakeDocumentRagService(ingestion_exception=exception)
+    message = FakeMessage(document=FakeDocument(), from_user=FakeUser(id=123))
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    assert message.answer_calls == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.PROCESSING_FAILURE_MESSAGE,
+    ]
+    assert "raw provider detail" not in caplog.text
+    assert "C:/secret" not in caplog.text
+    assert "event=document_upload_failed" in caplog.text
+
+
+class _ShutdownSignal(BaseException):
+    """Stands in for cancellation/shutdown: a BaseException the boundary must not swallow."""
+
+
+_UNEXPECTED_FAILURES = [
+    pytest.param(lambda: RuntimeError("boom sk-SECRET C:/secret/path user 123"), id="runtime"),
+    pytest.param(lambda: ValueError("bad value ns=telegram-documents-user-123"), id="value"),
+    pytest.param(lambda: KeyError("model-output: TOP-SECRET-USER-DATA"), id="key"),
+    pytest.param(lambda: AttributeError(f"provider detail {_SECRET_HOST}"), id="attribute"),
+]
+
+
+def _assert_unexpected_failure_leaked_nothing(replies: list[str], log_text: str) -> None:
+    for leaked in (
+        "sk-SECRET",
+        "C:/secret",
+        "user 123",
+        "telegram-documents-user",
+        "TOP-SECRET-USER-DATA",
+        _SECRET_HOST,
+        "Traceback",
+    ):
+        assert all(leaked not in reply for reply in replies)
+        assert leaked not in log_text
+
+
+@pytest.mark.parametrize("make_exception", _UNEXPECTED_FAILURES)
+def test_unexpected_ingestion_error_gets_one_fixed_failure_reply_not_silence(
+    make_exception: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    exception = make_exception()
+    document_service = FakeDocumentRagService(ingestion_exception=exception)
+    message = FakeMessage(document=FakeDocument(), from_user=FakeUser(id=123))
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    # The user was told the analysis started, so the boundary must end with exactly one
+    # fixed failure message -- and never a success message or a summary.
+    assert message.answer_calls == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.PROCESSING_FAILURE_MESSAGE,
+    ]
+    assert messages.UPLOAD_COMPLETED_MESSAGE not in message.answer_calls
+    assert _ingestion_outcome().summary not in message.answer_calls
+    assert "event=document_upload_unexpected_failure" in caplog.text
+    assert f"error_type={type(exception).__name__}" in caplog.text
+    assert "event=document_upload_failed" not in caplog.text
+    _assert_unexpected_failure_leaked_nothing(message.answer_calls, caplog.text)
+    assert all(record.exc_info is None for record in caplog.records)  # no traceback logged
+
+
+def test_unexpected_download_error_gets_one_fixed_failure_reply_not_silence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    document_service = FakeDocumentRagService()
+    message = FakeMessage(
+        document=FakeDocument(),
+        from_user=FakeUser(),
+        bot=FakeTelegramBot(exception=RuntimeError("download blew up sk-SECRET")),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    assert message.answer_calls == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.PROCESSING_FAILURE_MESSAGE,
+    ]
+    assert document_service.ingest_calls == []
+    assert "event=document_upload_unexpected_failure error_type=RuntimeError" in caplog.text
+    _assert_unexpected_failure_leaked_nothing(message.answer_calls, caplog.text)
+
+
+def test_dispatcher_unexpected_ingestion_error_is_answered_instead_of_escaping_to_aiogram(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    telegram_bot, dispatcher, session, memory_service, _, document_service = (
+        _build_dispatcher_harness()
+    )
+    document_service.ingestion_exception = RuntimeError("boom sk-SECRET")
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(dispatcher.feed_raw_update(telegram_bot, _make_update(document=True)))
+
+    replies = [sent["text"] for sent in session.sent_messages]
+    assert replies == [messages.UPLOAD_STARTED_MESSAGE, messages.PROCESSING_FAILURE_MESSAGE]
+    assert memory_service.remember_calls == []
+    # aiogram's own "Cause exception while process update" error log is never reached.
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    _assert_unexpected_failure_leaked_nothing(replies, caplog.text)
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        pytest.param(DocumentIngestionError("detail"), id="ingestion"),
+        pytest.param(DocumentRagServiceError("detail"), id="service"),
+        pytest.param(OSError("detail"), id="os-error"),
+        pytest.param(aiohttp.ClientConnectionError("detail"), id="aiohttp-client-error"),
+    ],
+)
+def test_known_failures_keep_their_own_branch_and_log_event(
+    exception: BaseException, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The broad boundary is only the last fallback: it must not take over the specific branches.
+    document_service = FakeDocumentRagService(ingestion_exception=exception)
+    message = FakeMessage(document=FakeDocument(), from_user=FakeUser(id=123))
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    assert "event=document_upload_failed" in caplog.text
+    assert "event=document_upload_unexpected_failure" not in caplog.text
+
+
+def test_summary_only_failure_never_reaches_the_unexpected_failure_boundary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    document_service = FakeDocumentRagService(
+        ingestion_exception=DocumentSummaryError("summary failed", document_ids=("doc-1",))
+    )
+    message = FakeMessage(document=FakeDocument(), from_user=FakeUser(id=123))
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    assert message.answer_calls == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.SUMMARY_UNAVAILABLE_MESSAGE,
+    ]
+    assert "event=document_upload_unexpected_failure" not in caplog.text
+
+
+@pytest.mark.parametrize("stage", ["download", "ingestion"])
+def test_boundary_does_not_catch_base_exceptions(stage: str) -> None:
+    # Cancellation / shutdown must keep propagating; the boundary is `except Exception`.
+    if stage == "download":
+        message = FakeMessage(
+            document=FakeDocument(),
+            from_user=FakeUser(),
+            bot=FakeTelegramBot(exception=_ShutdownSignal()),
+        )
+        document_service = FakeDocumentRagService()
+    else:
+        message = FakeMessage(document=FakeDocument(), from_user=FakeUser())
+        document_service = FakeDocumentRagService(ingestion_exception=_ShutdownSignal())
+
+    with pytest.raises(_ShutdownSignal):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    assert message.answer_calls == [messages.UPLOAD_STARTED_MESSAGE]  # no failure message either
+
+
+def test_summary_only_failure_is_reported_truthfully_as_indexed_but_without_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    document_service = FakeDocumentRagService(
+        ingestion_exception=DocumentSummaryError(
+            "summary provider failed: sk-SECRET user 123",
+            document_ids=("doc-1", "doc-2"),
+        )
+    )
+    message = FakeMessage(document=FakeDocument(), from_user=FakeUser(id=123))
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(
+            handlers.handle_document_upload(message, document_service, _processing_settings())
+        )
+
+    assert message.answer_calls == [
+        messages.UPLOAD_STARTED_MESSAGE,
+        messages.SUMMARY_UNAVAILABLE_MESSAGE,
+    ]
+    # Not the generic "could not process the file" message, and no "done"/summary either.
+    assert messages.PROCESSING_FAILURE_MESSAGE not in message.answer_calls
+    assert messages.UPLOAD_COMPLETED_MESSAGE not in message.answer_calls
+    # The handler never deletes anything: the indexed document is kept.
+    assert document_service.delete_user_documents_calls == []
+    assert "event=document_summary_failed" in caplog.text
+    assert "error_type=DocumentSummaryError" in caplog.text
+    assert "sk-SECRET" not in caplog.text
+    assert "sk-SECRET" not in "\n".join(message.answer_calls)
+
+
+def test_summary_unavailable_message_is_fixed_and_says_the_document_can_be_questioned() -> None:
+    text = messages.SUMMARY_UNAVAILABLE_MESSAGE
+
+    assert text != messages.PROCESSING_FAILURE_MESSAGE
+    assert "сохранён" in text
+    assert "вопросы" in text
+    assert not any(character.isdigit() for character in text)
+
+
+# ---------------------------------------------------------------------------
+# Routing end-to-end: real DocumentRagService + handler (fake model components)
+# ---------------------------------------------------------------------------
+
+
+class _StubComponent:
+    def __init__(self, result: Any) -> None:
+        self._result = result
+        self.calls: list[dict[str, Any]] = []
+
+    def run(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self._result
+
+
+class _StubRagPipeline:
+    def __init__(self, components: dict[str, _StubComponent]) -> None:
+        self._components = components
+
+    def get_component(self, name: str) -> _StubComponent:
+        return self._components[name]
+
+
+class _StubStoreFactory:
+    def create_document_store(self, user_id: int) -> object:
+        return object()
+
+
+def _routing_documents(
+    count: int = 3, *, scores: tuple[float | None, ...] = ()
+) -> list[Document]:
+    return [
+        Document(
+            id=f"doc-{position}",
+            content=f"Chunk {position}",
+            score=scores[position - 1] if position <= len(scores) else None,
+            meta={"file_name": "sample.pdf", "chunk_index": position - 1, "page_number": position},
+        )
+        for position in range(1, count + 1)
+    ]
+
+
+def _real_document_service(reply_text: str | None, documents: list[Document]) -> DocumentRagService:
+    replies = [] if reply_text is None else [ChatMessage.from_assistant(text=reply_text)]
+    pipeline = _StubRagPipeline(
+        {
+            "text_embedder": _StubComponent({"embedding": [0.1]}),
+            "retriever": _StubComponent({"documents": documents}),
+            "prompt_builder": _StubComponent({"prompt": [ChatMessage.from_user(text="prompt")]}),
+            "generator": _StubComponent({"replies": replies}),
+        }
+    )
+    return DocumentRagService(
+        _processing_settings(),
+        DocumentRagSettings(
+            _env_file=None,
+            PINECONE_API_KEY="pinecone-key",
+            PINECONE_INDEX_NAME="document-index",
+            OPENAI_API_KEY="openai-key",
+            OPENAI_BASE_URL="https://example.invalid/v1",
+            OPENAI_EMBEDDING_MODEL="embedding-model",
+            OPENAI_CHAT_MODEL="chat-model",
+        ),
+        adapter=object(),
+        document_store_factory=_StubStoreFactory(),
+        rag_pipeline_factory=lambda settings, store: pipeline,
+    )
+
+
+def _route_text_through_real_service(
+    reply_text: str | None, documents: list[Document] | None = None
+) -> tuple[FakeMessage, FakeReplyService, FakeMemoryService]:
+    memory_service = FakeMemoryService()
+    reply_service = FakeReplyService()
+    service = _real_document_service(
+        reply_text, _routing_documents() if documents is None else documents
+    )
+    message = FakeMessage(text="Какой бюджет Orion?", from_user=FakeUser())
+    asyncio.run(handlers.handle_text_message(message, memory_service, reply_service, service))
+    return message, reply_service, memory_service
+
+
+def _contract(**fields: Any) -> str:
+    payload = {
+        "answerable": True,
+        "answer": "Бюджет Orion — 4,2 млн евро.",
+        "source_ids": ["DOC_2"],
+    }
+    payload.update(fields)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _assert_nothing_internal_reached_the_user(message: FakeMessage) -> None:
+    shown = "\n".join(message.answer_calls)
+    for internal in ("answerable", "source_ids", "DOC_", "NO_ANSWER", "Traceback"):
+        assert internal not in shown
+    assert INSUFFICIENT_DOCUMENT_ANSWER not in shown
+
+
+def test_valid_document_route_uses_the_document_answer_and_only_the_cited_source() -> None:
+    message, reply_service, memory_service = _route_text_through_real_service(_contract())
+
+    assert message.answer_calls == [
+        "Бюджет Orion — 4,2 млн евро.",
+        "Источники:\n• sample.pdf, стр. 2",
+    ]
+    assert reply_service.generate_reply_calls == []  # Agent not invoked
+    _assert_nothing_internal_reached_the_user(message)
+    assert memory_service.remember_calls == [{"user_id": 123, "text": "Какой бюджет Orion?"}]
+
+
+def test_accepted_answer_with_a_low_score_cited_chunk_still_shows_that_source() -> None:
+    # Routing has no similarity threshold, and the display-only score filter must not undo
+    # that: a cited chunk scored far below the display floor is still shown as the source.
+    message, reply_service, _ = _route_text_through_real_service(
+        _contract(source_ids=["DOC_2"]),
+        _routing_documents(scores=(0.9, 0.01, 0.8)),
+    )
+
+    assert message.answer_calls == [
+        "Бюджет Orion — 4,2 млн евро.",
+        "Источники:\n• sample.pdf, стр. 2",
+    ]
+    assert reply_service.generate_reply_calls == []
+
+
+# Cited chunk positions and the scores of the three retrieved chunks. The cited chunks are
+# the only ones eligible as sources, whatever the display filter thinks of their scores.
+_CITATION_SCORE_CASES = [
+    pytest.param(["DOC_1"], (0.01, 0.9, 0.9), {"стр. 1"}, id="single-low"),
+    pytest.param(["DOC_1"], (0.0, 0.9, 0.9), {"стр. 1"}, id="single-zero"),
+    pytest.param(["DOC_1"], (-0.2, 0.9, 0.9), {"стр. 1"}, id="single-negative"),
+    pytest.param(["DOC_2"], (0.9, None, 0.9), {"стр. 2"}, id="single-unscored"),
+    pytest.param(["DOC_1", "DOC_2"], (0.01, 0.02, 0.9), {"стр. 2"}, id="all-low"),
+    pytest.param(["DOC_1", "DOC_2"], (0.0, None, 0.9), {"стр. 1"}, id="low-and-unscored"),
+    pytest.param(["DOC_1", "DOC_3"], (0.01, 0.9, 0.2), {"стр. 3"}, id="low-and-mid"),
+]
+
+
+@pytest.mark.parametrize(("cited", "scores", "expected_pages"), _CITATION_SCORE_CASES)
+def test_accepted_document_answer_always_shows_at_least_one_validated_cited_source(
+    cited: list[str], scores: tuple[float | None, ...], expected_pages: set[str]
+) -> None:
+    message, reply_service, _ = _route_text_through_real_service(
+        _contract(source_ids=cited), _routing_documents(scores=scores)
+    )
+
+    assert reply_service.generate_reply_calls == []  # accepted as a document answer
+    assert len(message.answer_calls) == 2
+    answer_text, sources_block = message.answer_calls
+    assert answer_text == "Бюджет Orion — 4,2 млн евро."
+    assert sources_block.startswith("Источники:\n")
+    shown_pages = {line.rsplit(", ", 1)[1] for line in sources_block.splitlines()[1:]}
+    cited_pages = {f"стр. {label.removeprefix('DOC_')}" for label in cited}
+    assert shown_pages  # never an accepted answer with zero visible sources
+    assert shown_pages == expected_pages
+    assert shown_pages <= cited_pages  # only validated cited chunks, never an uncited one
+    assert len(shown_pages) <= 2  # the display cap still applies
+    _assert_nothing_internal_reached_the_user(message)
+
+
+def test_explicit_not_answerable_routes_to_the_agent_without_document_text() -> None:
+    message, reply_service, memory_service = _route_text_through_real_service(
+        _contract(answerable=False, answer=None, source_ids=[])
+    )
+
+    assert message.answer_calls == ["generated reply"]
+    assert len(reply_service.generate_reply_calls) == 1
+    _assert_nothing_internal_reached_the_user(message)
+    assert len(memory_service.remember_calls) == 1
+
+
+def test_zero_retrieved_documents_route_to_the_agent() -> None:
+    message, reply_service, _ = _route_text_through_real_service(_contract(), documents=[])
+
+    assert message.answer_calls == ["generated reply"]
+    assert len(reply_service.generate_reply_calls) == 1
+
+
+_ROUTE_TO_AGENT_REPLIES = [
+    pytest.param("totally not json", id="prose"),
+    pytest.param(None, id="blank-reply"),
+    pytest.param('{"answerable": true, "answer": "x"}', id="missing-field"),
+    pytest.param(_contract(answerable="true"), id="answerable-string"),
+    pytest.param(_contract(answer="  "), id="blank-answer"),
+    pytest.param(_contract(source_ids=[]), id="no-sources"),
+    pytest.param(_contract(source_ids=["DOC_7"]), id="unknown-source"),
+    pytest.param(_contract(source_ids=["DOC_1", "DOC_7"]), id="mixed-valid-and-fabricated"),
+    pytest.param(INSUFFICIENT_DOCUMENT_ANSWER, id="old-sentinel-exact"),
+    pytest.param(f'"{INSUFFICIENT_DOCUMENT_ANSWER}"', id="old-sentinel-quoted"),
+    pytest.param(INSUFFICIENT_DOCUMENT_ANSWER + "!", id="old-sentinel-punctuated"),
+    pytest.param(
+        INSUFFICIENT_DOCUMENT_ANSWER + " Уточните вопрос.", id="old-sentinel-plus-sentence"
+    ),
+    pytest.param("В документах нет сведений для ответа.", id="paraphrased-insufficient"),
+    pytest.param("NO_ANSWER", id="internal-token"),
+]
+
+
+@pytest.mark.parametrize("reply_text", _ROUTE_TO_AGENT_REPLIES)
+def test_malformed_or_unsafe_model_output_routes_to_the_agent_and_shows_nothing_internal(
+    reply_text: str | None,
+) -> None:
+    message, reply_service, memory_service = _route_text_through_real_service(reply_text)
+
+    # Before the machine contract the old-sentinel variants were *shown to the user* as a
+    # grounded answer (plus sources). Now the Agent answers and nothing internal leaks.
+    assert message.answer_calls == ["generated reply"]
+    assert len(reply_service.generate_reply_calls) == 1
+    _assert_nothing_internal_reached_the_user(message)
     assert len(memory_service.remember_calls) == 1

@@ -13,8 +13,8 @@ from haystack.utils import Secret
 from haystack_integrations.components.retrievers.pinecone import PineconeEmbeddingRetriever
 from haystack_integrations.document_stores.pinecone import PineconeDocumentStore
 
+from hay_v2_bot.components.answer_contract import DOCUMENT_LABEL_PREFIX
 from hay_v2_bot.config import DocumentRagSettings
-from hay_v2_bot.models.rag import INSUFFICIENT_DOCUMENT_ANSWER
 
 _DOCUMENT_FILTER = {"field": "record_type", "operator": "==", "value": "document_chunk"}
 
@@ -116,14 +116,26 @@ def build_rag_pipeline(
                     "Answer in Russian even if the retrieved documents are in English. "
                     "Preserve exact names, dates, numbers, currencies, and units. "
                     "Do not use unsupported external facts. "
-                    "If the evidence is insufficient, return exactly: "
-                    f'"{INSUFFICIENT_DOCUMENT_ANSWER}"'
+                    "Each retrieved chunk is labelled with an id such as "
+                    f"{DOCUMENT_LABEL_PREFIX}1. "
+                    "Reply with exactly one JSON object and nothing else: no Markdown, "
+                    "no code fences, no commentary. "
+                    "It must have exactly these keys: "
+                    '"answerable" (true only if the retrieved chunks contain enough '
+                    "information to answer the question, otherwise false), "
+                    '"answer" (the answer as a string when answerable is true, otherwise '
+                    'null), and "source_ids" (the ids of the chunks the answer is based '
+                    "on when answerable is true, otherwise an empty list). "
+                    "List only ids that appear in the retrieved chunks, and do not "
+                    "mention chunk ids inside the answer text. "
+                    "If the evidence is insufficient, set answerable to false."
                 ),
                 ChatMessage.from_user(
                     "Question: {{ question }}\n\n"
                     "Retrieved chunks:\n"
                     "{% for document in documents %}"
-                    "[Source {{ loop.index0 }} | file={{ document.meta.file_name }} "
+                    "[" + DOCUMENT_LABEL_PREFIX + "{{ loop.index }} "
+                    "| file={{ document.meta.file_name }} "
                     "| chunk={{ document.meta.chunk_index }}"
                     "{% if document.meta.page_number is defined "
                     "and document.meta.page_number is not none %}"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hay_v2_bot.components import parse_document_answer
 from hay_v2_bot.config import DocumentRagSettings
 from hay_v2_bot.models import INSUFFICIENT_DOCUMENT_ANSWER
 from hay_v2_bot.pipelines import (
@@ -9,6 +10,7 @@ from hay_v2_bot.pipelines import (
     build_rag_pipeline,
     build_summary_pipeline,
 )
+from haystack import Document
 from haystack.document_stores.types import DuplicatePolicy
 from haystack.utils import Secret
 from haystack_integrations.document_stores.pinecone import PineconeDocumentStore
@@ -82,7 +84,7 @@ def test_summary_pipeline_builds_with_russian_single_sentence_prompt_and_determi
     assert generator.generation_kwargs == {"temperature": 0}
 
 
-def test_rag_pipeline_builds_with_russian_answer_contract_and_exact_fallback_prompt() -> None:
+def test_rag_pipeline_builds_with_russian_answer_and_machine_readable_contract_prompt() -> None:
     settings = _settings()
     store = _document_store()
 
@@ -110,10 +112,93 @@ def test_rag_pipeline_builds_with_russian_answer_contract_and_exact_fallback_pro
     assert "Answer only from the retrieved documents." in system_text
     assert "Answer in Russian even if the retrieved documents are in English." in system_text
     assert "Preserve exact names, dates, numbers, currencies, and units." in system_text
-    assert INSUFFICIENT_DOCUMENT_ANSWER in system_text
+    # Routing is machine-readable: the prompt asks for a JSON contract, and the old
+    # "return exactly this Russian sentence" instruction is gone.
+    assert INSUFFICIENT_DOCUMENT_ANSWER not in system_text
+    for contract_text in ('"answerable"', '"answer"', '"source_ids"', "JSON object", "DOC_1"):
+        assert contract_text in system_text
     assert generator.model == "chat-model"
     assert generator.api_base_url == "https://example.invalid/v1"
+    # No provider-specific structured-output option: the deterministic parser is the contract.
     assert generator.generation_kwargs == {"temperature": 0}
+
+
+def _documents_for_prompt() -> list[Document]:
+    return [
+        Document(
+            id="doc-" + "a" * 64 + "-chunk-000000",
+            content="Первый фрагмент про бюджет.",
+            meta={"file_name": "plan.pdf", "chunk_index": 0, "page_number": 3},
+        ),
+        Document(
+            id="doc-" + "a" * 64 + "-chunk-000001",
+            content="Второй фрагмент про сроки.",
+            meta={"file_name": "plan.pdf", "chunk_index": 1},
+        ),
+        Document(
+            id="doc-" + "b" * 64 + "-chunk-000000",
+            content="Третий фрагмент.",
+            meta={"file_name": "other.docx", "chunk_index": 0},
+        ),
+    ]
+
+
+def test_rag_prompt_labels_retrieved_chunks_with_per_request_ids_in_order() -> None:
+    pipeline = build_rag_pipeline(_settings(), _document_store())
+    prompt_builder = pipeline.get_component("prompt_builder")
+
+    messages = prompt_builder.run(question="Какой бюджет?", documents=_documents_for_prompt())[
+        "prompt"
+    ]
+    user_text = messages[1].text
+
+    assert "Question: Какой бюджет?" in user_text
+    positions = [user_text.index(f"[DOC_{n} ") for n in (1, 2, 3)]
+    assert positions == sorted(positions)
+    assert "[DOC_4 " not in user_text
+    assert "[DOC_1 | file=plan.pdf | chunk=0 | page=3]\nПервый фрагмент про бюджет." in user_text
+    assert "[DOC_2 | file=plan.pdf | chunk=1]\nВторой фрагмент про сроки." in user_text
+    assert "[DOC_3 | file=other.docx | chunk=0]\nТретий фрагмент." in user_text
+
+
+def test_rag_prompt_does_not_expose_storage_ids_or_namespaces() -> None:
+    pipeline = build_rag_pipeline(_settings(), _document_store())
+    prompt_builder = pipeline.get_component("prompt_builder")
+
+    messages = prompt_builder.run(question="Q?", documents=_documents_for_prompt())["prompt"]
+    full_prompt = "\n".join(message.text for message in messages)
+
+    assert "doc-" + "a" * 64 not in full_prompt
+    assert "-chunk-0000" not in full_prompt
+    assert "telegram-documents-user" not in full_prompt
+    assert "pinecone-key" not in full_prompt
+    assert "openai-key" not in full_prompt
+
+
+def test_rag_system_prompt_survives_template_rendering_with_the_json_contract_intact() -> None:
+    pipeline = build_rag_pipeline(_settings(), _document_store())
+    prompt_builder = pipeline.get_component("prompt_builder")
+
+    rendered_system = prompt_builder.run(question="Q?", documents=_documents_for_prompt())[
+        "prompt"
+    ][0].text
+
+    assert rendered_system == prompt_builder.template[0].texts[0]
+    assert "exactly one JSON object" in rendered_system
+
+
+def test_prompt_labels_match_the_ids_the_parser_accepts() -> None:
+    # The template and the parser share one label scheme (DOC_<1-based position>).
+    pipeline = build_rag_pipeline(_settings(), _document_store())
+    prompt_builder = pipeline.get_component("prompt_builder")
+    documents = _documents_for_prompt()
+    user_text = prompt_builder.run(question="Q?", documents=documents)["prompt"][1].text
+
+    for position in range(1, len(documents) + 1):
+        label = f"DOC_{position}"
+        assert f"[{label} " in user_text
+        reply = '{"answerable": true, "answer": "x", "source_ids": ["' + label + '"]}'
+        assert parse_document_answer(reply, {"DOC_1", "DOC_2", "DOC_3"}).source_labels == (label,)
 
 
 def test_factories_use_fresh_component_instances() -> None:

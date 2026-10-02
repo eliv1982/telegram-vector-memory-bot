@@ -108,6 +108,32 @@ def test_format_sources_block_retains_best_source_below_absolute_threshold() -> 
     assert messages.format_sources_block(sources) == "Источники:\n• aurora.pdf, стр. 2"
 
 
+def test_format_sources_block_shows_a_source_even_when_every_score_is_far_below_the_floor() -> None:
+    sources = (
+        _source("doc-1", "aurora.pdf", 0, page_number=2, score=0.01),
+        _source("doc-2", "appendix.pdf", 0, page_number=5, score=-0.3),
+    )
+
+    assert messages.format_sources_block(sources) == "Источники:\n• aurora.pdf, стр. 2"
+
+
+def test_format_sources_block_never_renders_empty_for_non_empty_sources() -> None:
+    # The display filter is cosmetic: whatever the score mix, a non-empty source list
+    # (the validated cited chunks of an accepted answer) always yields a visible source.
+    score_values: tuple[float | None, ...] = (None, -1.0, 0.0, 0.01, 0.24, 0.25, 0.9)
+    for first in score_values:
+        for second in score_values:
+            sources = (
+                _source("doc-1", "aurora.pdf", 0, page_number=1, score=first),
+                _source("doc-2", "appendix.pdf", 1, page_number=2, score=second),
+            )
+
+            rendered = messages.format_sources_block(sources)
+
+            assert rendered.startswith("Источники:\n• "), (first, second)
+            assert 1 <= rendered.count("\n• ") <= 2, (first, second)
+
+
 def test_format_sources_block_missing_score_sources_preserve_order() -> None:
     sources = (
         _source("doc-1", "contract.docx", 2),

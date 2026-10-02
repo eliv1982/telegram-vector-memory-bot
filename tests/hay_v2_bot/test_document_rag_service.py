@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -95,6 +97,7 @@ class FakeStoreFactory:
         self.delete_calls: list[tuple[int, tuple[str, ...]]] = []
         self.delete_namespace_calls: list[int] = []
         self.delete_namespace_exception: BaseException | None = None
+        self.delete_exception: BaseException | None = None
         self.created_stores: dict[int, dict[str, object]] = {}
 
     def create_document_store(self, user_id: int) -> dict[str, object]:
@@ -108,6 +111,8 @@ class FakeStoreFactory:
 
     def delete_documents(self, user_id: int, document_ids: Sequence[str]) -> None:
         self.delete_calls.append((user_id, tuple(document_ids)))
+        if self.delete_exception is not None:
+            raise self.delete_exception
 
     def delete_user_namespace(self, user_id: int) -> None:
         self.delete_namespace_calls.append(user_id)
@@ -257,6 +262,64 @@ def _conversion_result(documents: Sequence[Document] | None = None) -> DocumentC
         content_type=PDF_CONTENT_TYPE,
         documents=list(documents) if documents is not None else list(_documents()),
     )
+
+
+def _contract_json(
+    *,
+    answerable: bool = True,
+    answer: str | None = "Бюджет составляет 4,2 млн евро.",
+    source_ids: Sequence[str] = ("DOC_1",),
+) -> str:
+    return json.dumps(
+        {"answerable": answerable, "answer": answer, "source_ids": list(source_ids)},
+        ensure_ascii=False,
+    )
+
+
+def _reply(text: str) -> dict[str, Any]:
+    return {"replies": [ChatMessage.from_assistant(text=text)]}
+
+
+def _retrieved_documents(count: int = 3, *, scores: Sequence[float | None] = ()) -> list[Document]:
+    return [
+        Document(
+            id=f"doc-{position}",
+            content=f"Chunk {position}",
+            score=scores[position - 1] if position <= len(scores) else None,
+            meta={"file_name": "sample.pdf", "chunk_index": position - 1, "page_number": position},
+        )
+        for position in range(1, count + 1)
+    ]
+
+
+def _answer_for_reply(
+    reply_text: str,
+    documents: Sequence[Document] | None = None,
+) -> tuple[Any, FakeComponent, FakeComponent]:
+    retrieved = _retrieved_documents() if documents is None else list(documents)
+    prompt_builder = FakeComponent(result={"prompt": [ChatMessage.from_user(text="prompt")]})
+    generator = FakeComponent(result=_reply(reply_text))
+    service = DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(),
+        document_store_factory=FakeStoreFactory(),
+        rag_pipeline_factory=lambda settings, store: FakeRagPipeline(
+            {
+                "text_embedder": FakeComponent(result={"embedding": [0.1]}),
+                "retriever": FakeComponent(result={"documents": retrieved}),
+                "prompt_builder": prompt_builder,
+                "generator": generator,
+            }
+        ),
+    )
+    return service.answer_question(123, "Какой бюджет?"), prompt_builder, generator
+
+
+def _assert_fallback(answer: Any) -> None:
+    assert answer.fallback_used is True
+    assert answer.sources == ()
+    assert answer.used_document_count == 0
 
 
 def test_pinecone_factory_uses_document_namespace_and_never_creates_index() -> None:
@@ -516,13 +579,13 @@ def test_answer_question_returns_grounded_sources_preserves_order_and_deduplicat
     retriever = FakeComponent(result={"documents": list(retrieved_documents)})
     prompt_builder = FakeComponent(result={"prompt": [ChatMessage.from_user(text="prompt")]})
     generator = FakeComponent(
-        result={
-            "replies": [
-                ChatMessage.from_assistant(
-                    text="Утвержденный бюджет пилотного проекта Orion составляет 4,2 миллиона евро."
-                )
-            ]
-        }
+        result=_reply(
+            _contract_json(
+                answer="Утвержденный бюджет пилотного проекта Orion составляет 4,2 миллиона евро.",
+                # DOC_1 and DOC_2 share a storage id: cited twice, sourced once.
+                source_ids=["DOC_1", "DOC_2", "DOC_3"],
+            )
+        )
     )
     store_factory = FakeStoreFactory()
     service = DocumentRagService(
@@ -592,38 +655,13 @@ def test_answer_question_returns_exact_fallback_without_calling_generator_when_n
     assert generator.calls == []
 
 
-def test_answer_question_marks_exact_fallback_reply() -> None:
-    retrieved_documents = [
-        Document(id="doc-1", content="Chunk", meta={"file_name": "sample.pdf", "chunk_index": 0})
-    ]
-    service = DocumentRagService(
-        _processing_settings(),
-        _rag_settings(),
-        adapter=FakeAdapter(),
-        document_store_factory=FakeStoreFactory(),
-        rag_pipeline_factory=lambda settings, store: FakeRagPipeline(
-            {
-                "text_embedder": FakeComponent(result={"embedding": [0.1]}),
-                "retriever": FakeComponent(result={"documents": retrieved_documents}),
-                "prompt_builder": FakeComponent(
-                    result={"prompt": [ChatMessage.from_user(text="prompt")]}
-                ),
-                "generator": FakeComponent(
-                    result={
-                        "replies": [
-                            ChatMessage.from_assistant(text=INSUFFICIENT_DOCUMENT_ANSWER)
-                        ]
-                    }
-                ),
-            }
-        ),
-    )
+def test_answer_question_treats_the_old_sentinel_sentence_as_malformed_output() -> None:
+    # The old contract matched this sentence exactly and *kept* the retrieved sources. Under
+    # the machine contract it is just prose: a fallback with no sources at all.
+    answer, _, _ = _answer_for_reply(INSUFFICIENT_DOCUMENT_ANSWER, _retrieved_documents(1))
 
-    answer = service.answer_question(123, "What is the approved budget?")
-
-    assert answer.answer == INSUFFICIENT_DOCUMENT_ANSWER
-    assert answer.fallback_used is True
-    assert answer.used_document_count == 1
+    assert answer.answer == INSUFFICIENT_DOCUMENT_ANSWER  # inert placeholder, never routed on
+    _assert_fallback(answer)
 
 
 def test_english_document_chunks_still_allow_russian_summary_and_rag_answer() -> None:
@@ -679,16 +717,15 @@ def test_english_document_chunks_still_allow_russian_summary_and_rag_answer() ->
                 result={"prompt": [ChatMessage.from_user(text="prompt")]}
             ),
             "generator": FakeComponent(
-                result={
-                    "replies": [
-                        ChatMessage.from_assistant(
-                            text=(
-                                "Утвержденный бюджет пилотного проекта Orion "
-                                "составляет 4,2 миллиона евро."
-                            )
-                        )
-                    ]
-                }
+                result=_reply(
+                    _contract_json(
+                        answer=(
+                            "Утвержденный бюджет пилотного проекта Orion "
+                            "составляет 4,2 миллиона евро."
+                        ),
+                        source_ids=["DOC_2"],
+                    )
+                )
             ),
         }
     )
@@ -807,4 +844,414 @@ def test_service_delete_user_documents_rejects_invalid_user_id_before_store_call
     with pytest.raises(DocumentRagServiceError):
         service.delete_user_documents(user_id)
 
+    assert store_factory.delete_namespace_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Document-vs-Agent routing: explicit, evidence-gated, fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_valid_contract_reply_returns_a_document_answer_with_only_the_cited_sources() -> None:
+    documents = _retrieved_documents(3, scores=(0.9, 0.8, 0.7))
+
+    answer, prompt_builder, generator = _answer_for_reply(
+        _contract_json(source_ids=["DOC_2"]), documents
+    )
+
+    assert answer.fallback_used is False
+    assert answer.answer == "Бюджет составляет 4,2 млн евро."
+    # Only the cited chunk is a source -- not the other two that were retrieved.
+    assert [source.document_id for source in answer.sources] == ["doc-2"]
+    assert answer.used_document_count == 1
+    assert answer.sources[0].chunk_index == 1
+    assert answer.sources[0].page_number == 2
+    # All three chunks were supplied to the model; the generator ran exactly once.
+    assert prompt_builder.calls[0]["documents"] == documents
+    assert len(generator.calls) == 1
+
+
+def test_cited_sources_keep_citation_order_and_are_deduplicated() -> None:
+    answer, _, _ = _answer_for_reply(_contract_json(source_ids=["DOC_3", "DOC_1", "DOC_3"]))
+
+    assert [source.document_id for source in answer.sources] == ["doc-3", "doc-1"]
+
+
+def test_sources_are_built_only_from_documents_actually_supplied_to_the_model() -> None:
+    answer, prompt_builder, _ = _answer_for_reply(
+        _contract_json(source_ids=["DOC_1", "DOC_3"]), _retrieved_documents(3)
+    )
+
+    supplied_ids = {document.id for document in prompt_builder.calls[0]["documents"]}
+    assert {source.document_id for source in answer.sources} <= supplied_ids
+
+
+def test_explicit_not_answerable_falls_back_even_though_documents_were_retrieved() -> None:
+    answer, _, generator = _answer_for_reply(
+        _contract_json(answerable=False, answer=None, source_ids=[]),
+        _retrieved_documents(3, scores=(0.99, 0.98, 0.97)),
+    )
+
+    _assert_fallback(answer)
+    assert len(generator.calls) == 1
+
+
+_MALFORMED_REPLIES = [
+    pytest.param("not json at all", id="prose"),
+    pytest.param("[]", id="array"),
+    pytest.param('{"answerable": true, "answer": "x"}', id="missing-source_ids"),
+    pytest.param('{"answer": "x", "source_ids": ["DOC_1"]}', id="missing-answerable"),
+    pytest.param(_contract_json().replace("true", '"true"'), id="answerable-string"),
+    pytest.param('{"answerable": true, "answer": 5, "source_ids": ["DOC_1"]}', id="answer-number"),
+    pytest.param(_contract_json(answer="   "), id="blank-answer"),
+    pytest.param(_contract_json(answer=None), id="null-answer"),
+    pytest.param(_contract_json(source_ids=[]), id="no-sources"),
+    pytest.param(_contract_json(source_ids=["DOC_9"]), id="unknown-source"),
+    pytest.param(_contract_json(source_ids=["doc-1"]), id="storage-id-instead-of-label"),
+    pytest.param(_contract_json(source_ids=["DOC_1", "DOC_9"]), id="valid-and-fabricated-mixed"),
+]
+
+
+@pytest.mark.parametrize("reply_text", _MALFORMED_REPLIES)
+def test_malformed_or_unsafe_generator_output_falls_back_without_any_document_answer(
+    reply_text: str,
+) -> None:
+    answer, _, _ = _answer_for_reply(reply_text)
+
+    _assert_fallback(answer)
+
+
+_SENTINEL_VARIANTS = [
+    pytest.param(INSUFFICIENT_DOCUMENT_ANSWER, id="exact"),
+    pytest.param(f'"{INSUFFICIENT_DOCUMENT_ANSWER}"', id="quoted"),
+    pytest.param(INSUFFICIENT_DOCUMENT_ANSWER + "!", id="plus-punctuation"),
+    pytest.param(
+        INSUFFICIENT_DOCUMENT_ANSWER + " Попробуйте уточнить вопрос.", id="plus-sentence"
+    ),
+    pytest.param("В документах нет данных, чтобы ответить на этот вопрос.", id="paraphrase"),
+    pytest.param("NO_ANSWER", id="internal-token"),
+]
+
+
+@pytest.mark.parametrize("reply_text", _SENTINEL_VARIANTS)
+def test_old_sentinel_variants_never_become_a_grounded_document_answer(reply_text: str) -> None:
+    # Before the machine contract, every variant except the exact sentence was returned to the
+    # user as a *grounded* answer together with a source block.
+    answer, _, _ = _answer_for_reply(reply_text)
+
+    _assert_fallback(answer)
+
+
+def test_sentinel_text_inside_an_answerable_contract_reply_is_not_treated_as_fallback() -> None:
+    # Routing reads the machine fields, not the prose: the sentence has no special authority.
+    answer, _, _ = _answer_for_reply(
+        _contract_json(answer=INSUFFICIENT_DOCUMENT_ANSWER, source_ids=["DOC_1"])
+    )
+
+    assert answer.fallback_used is False
+    assert [source.document_id for source in answer.sources] == ["doc-1"]
+
+
+def test_no_relevance_threshold_a_low_scored_cited_chunk_is_still_a_document_answer() -> None:
+    answer, _, _ = _answer_for_reply(
+        _contract_json(source_ids=["DOC_1"]),
+        _retrieved_documents(1, scores=(0.01,)),
+    )
+
+    assert answer.fallback_used is False
+    assert answer.sources[0].score == 0.01  # existing runtime data preserved, not filtered
+
+
+def test_zero_retrieved_documents_falls_back_without_calling_the_model() -> None:
+    answer, prompt_builder, generator = _answer_for_reply(_contract_json(), documents=[])
+
+    _assert_fallback(answer)
+    assert prompt_builder.calls == []
+    assert generator.calls == []
+
+
+def test_expected_fallback_is_logged_at_info_with_only_a_reason_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="hay_v2_bot.services.document_rag"):
+        _answer_for_reply(_contract_json(answerable=False, answer=None, source_ids=[]))
+
+    records = [r for r in caplog.records if "document_answer_fallback" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (logging.INFO, "event=document_answer_fallback reason=not_answerable")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reply_text", "reason"),
+    [
+        ("TOP-SECRET-USER-DATA prose", "invalid_format"),
+        (_contract_json(answer="TOP-SECRET-USER-DATA", source_ids=["DOC_9"]), "unknown_source"),
+        (_contract_json(answer="TOP-SECRET-USER-DATA", source_ids=[]), "no_sources"),
+    ],
+)
+def test_malformed_fallback_is_a_warning_and_never_logs_model_output(
+    caplog: pytest.LogCaptureFixture, reply_text: str, reason: str
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="hay_v2_bot.services.document_rag"):
+        _answer_for_reply(reply_text)
+
+    records = [r for r in caplog.records if "document_answer_fallback" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (logging.WARNING, f"event=document_answer_fallback reason={reason}")
+    ]
+    assert "TOP-SECRET-USER-DATA" not in caplog.text
+
+
+@pytest.mark.parametrize("replies", [[], [ChatMessage.from_assistant(text="   ")]])
+def test_reply_with_no_usable_text_is_still_a_controlled_question_error(
+    replies: list[ChatMessage],
+) -> None:
+    # Structural failures of the chat reply (nothing to parse, as opposed to a reply that
+    # violates the contract) keep their old behaviour: a controlled DocumentQuestionError,
+    # which the Telegram handler turns into an Agent fallback.
+    service = DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(),
+        document_store_factory=FakeStoreFactory(),
+        rag_pipeline_factory=lambda settings, store: FakeRagPipeline(
+            {
+                "text_embedder": FakeComponent(result={"embedding": [0.1]}),
+                "retriever": FakeComponent(result={"documents": _retrieved_documents(1)}),
+                "prompt_builder": FakeComponent(
+                    result={"prompt": [ChatMessage.from_user(text="prompt")]}
+                ),
+                "generator": FakeComponent(result={"replies": replies}),
+            }
+        ),
+    )
+
+    with pytest.raises(DocumentQuestionError):
+        service.answer_question(123, "Какой бюджет?")
+
+
+# ---------------------------------------------------------------------------
+# Upload lifecycle: summary-only failure and partial writes
+# ---------------------------------------------------------------------------
+
+
+class WritingPipeline:
+    """Fake ingestion pipeline that really "stores" the documents it is given."""
+
+    def __init__(self, stored: dict[str, Document]) -> None:
+        self._stored = stored
+
+    def run(self, payload: Any) -> Any:
+        for document in payload["embedder"]["documents"]:
+            self._stored[document.id] = document
+        return {"writer": {"documents_written": len(payload["embedder"]["documents"])}}
+
+
+def test_summary_only_failure_keeps_the_indexed_chunks_and_they_stay_answerable() -> None:
+    stored: dict[str, Document] = {}
+    store_factory = FakeStoreFactory()
+    service = DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(result=_conversion_result()),
+        document_store_factory=store_factory,
+        ingestion_pipeline_factory=lambda settings, store: WritingPipeline(stored),
+        summary_pipeline_factory=lambda settings: FakePipelineRunner(
+            exception=RuntimeError("summary provider down")
+        ),
+        rag_pipeline_factory=lambda settings, store: FakeRagPipeline(
+            {
+                "text_embedder": FakeComponent(result={"embedding": [0.1]}),
+                "retriever": FakeComponent(
+                    result=lambda **_: {"documents": list(stored.values())}
+                ),
+                "prompt_builder": FakeComponent(
+                    result={"prompt": [ChatMessage.from_user(text="prompt")]}
+                ),
+                "generator": FakeComponent(
+                    result=_reply(_contract_json(source_ids=["DOC_2"]))
+                ),
+            }
+        ),
+    )
+
+    with pytest.raises(DocumentSummaryError) as exc_info:
+        service.ingest_and_summarize(_request())
+
+    # Indexing succeeded, so the failure is reported *with* the ids and nothing is deleted.
+    assert exc_info.value.document_ids == ("doc-1", "doc-2")
+    assert set(stored) == {"doc-1", "doc-2"}
+    assert store_factory.delete_calls == []
+    assert store_factory.delete_namespace_calls == []
+
+    # The stored document is still usable for grounded answers.
+    answer = service.answer_question(123, "Какой бюджет?")
+    assert answer.fallback_used is False
+    assert [source.document_id for source in answer.sources] == ["doc-2"]
+
+
+def _service_reporting_write_count(
+    written: int,
+    store_factory: FakeStoreFactory,
+    *,
+    pipeline_exception: BaseException | None = None,
+    summary_pipeline: FakePipelineRunner | None = None,
+) -> DocumentRagService:
+    if pipeline_exception is not None:
+        ingestion_pipeline = FakePipelineRunner(exception=pipeline_exception)
+    else:
+        ingestion_pipeline = FakePipelineRunner(result={"writer": {"documents_written": written}})
+    summary = summary_pipeline if summary_pipeline is not None else FakePipelineRunner(result={})
+    return DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(result=_conversion_result()),  # two chunks: doc-1, doc-2
+        document_store_factory=store_factory,
+        ingestion_pipeline_factory=lambda settings, store: ingestion_pipeline,
+        summary_pipeline_factory=lambda settings: summary,
+    )
+
+
+def test_partial_write_is_reported_as_failed_without_any_destructive_cleanup() -> None:
+    store_factory = FakeStoreFactory()
+    service = _service_reporting_write_count(1, store_factory)  # 1 of 2 chunks committed
+
+    with pytest.raises(DocumentIngestionError) as exc_info:
+        service.ingest_and_summarize(_request(user_id=123))
+
+    # Reported as a failed/incomplete ingestion with the existing fixed, user-safe message
+    # (the handler maps DocumentIngestionError to PROCESSING_FAILURE_MESSAGE) ...
+    assert str(exc_info.value) == "Document store reported an unexpected write count"
+    assert exc_info.value.document_ids == ("doc-1", "doc-2")
+    # ... and nothing is deleted: the deterministic ids may belong to an earlier upload.
+    assert store_factory.delete_calls == []
+    assert store_factory.delete_namespace_calls == []
+
+
+@pytest.mark.parametrize("written", [0, 1, 3])
+def test_no_write_count_mismatch_ever_deletes_anything(written: int) -> None:
+    # 0: nothing committed. 1 of 2: a partial write. 3 of 2: more than expected.
+    store_factory = FakeStoreFactory()
+    service = _service_reporting_write_count(written, store_factory)
+
+    with pytest.raises(DocumentIngestionError):
+        service.ingest_and_summarize(_request())
+
+    assert store_factory.delete_calls == []
+    assert store_factory.delete_namespace_calls == []
+
+
+class PartiallyCommittingPipeline:
+    """Fake ingestion pipeline that upserts by id but only commits the first N documents.
+
+    Mirrors the Pinecone SDK, which reports failed upsert batches through a short
+    ``documents_written`` count instead of raising.
+    """
+
+    def __init__(self, stored: dict[str, Document], commit_limit: int | None) -> None:
+        self._stored = stored
+        self.commit_limit = commit_limit  # None: commit everything
+
+    def run(self, payload: Any) -> Any:
+        documents = payload["embedder"]["documents"]
+        committed = documents if self.commit_limit is None else documents[: self.commit_limit]
+        for document in committed:
+            self._stored[document.id] = document  # upsert/overwrite by deterministic id
+        return {"writer": {"documents_written": len(committed)}}
+
+
+def _service_over_partially_committing_store(
+    stored: dict[str, Document],
+    pipeline: PartiallyCommittingPipeline,
+    store_factory: FakeStoreFactory,
+) -> DocumentRagService:
+    return DocumentRagService(
+        _processing_settings(),
+        _rag_settings(),
+        adapter=FakeAdapter(result=_conversion_result()),  # two chunks: doc-1, doc-2
+        document_store_factory=store_factory,
+        ingestion_pipeline_factory=lambda settings, store: pipeline,
+        summary_pipeline_factory=lambda settings: FakePipelineRunner(
+            result={
+                "generator": {
+                    "replies": [ChatMessage.from_assistant(text="Документ описывает пилот Orion.")]
+                }
+            }
+        ),
+    )
+
+
+def test_failed_reupload_of_an_identical_file_keeps_the_earlier_successful_chunks() -> None:
+    # The hazard that rules out cleanup: chunk ids are derived from the file content, so a
+    # re-upload of the same file targets the very ids an earlier, complete upload wrote.
+    stored: dict[str, Document] = {}
+    store_factory = FakeStoreFactory()
+    pipeline = PartiallyCommittingPipeline(stored, commit_limit=None)
+    service = _service_over_partially_committing_store(stored, pipeline, store_factory)
+    service.ingest_and_summarize(_request())  # first upload: complete
+    assert set(stored) == {"doc-1", "doc-2"}
+
+    pipeline.commit_limit = 1  # the identical re-upload fails part-way
+    with pytest.raises(DocumentIngestionError):
+        service.ingest_and_summarize(_request())
+
+    assert set(stored) == {"doc-1", "doc-2"}  # the earlier upload's chunks survive
+    assert store_factory.delete_calls == []
+    assert store_factory.delete_namespace_calls == []
+
+
+def test_retry_of_the_same_document_completes_after_a_partial_write() -> None:
+    stored: dict[str, Document] = {}
+    store_factory = FakeStoreFactory()
+    pipeline = PartiallyCommittingPipeline(stored, commit_limit=1)
+    service = _service_over_partially_committing_store(stored, pipeline, store_factory)
+
+    with pytest.raises(DocumentIngestionError):
+        service.ingest_and_summarize(_request())  # only doc-1 committed; reported as failed
+    assert set(stored) == {"doc-1"}
+
+    pipeline.commit_limit = None  # the user sends the same file again
+    outcome = service.ingest_and_summarize(_request())
+
+    assert set(stored) == {"doc-1", "doc-2"}
+    assert outcome.documents_written == outcome.chunk_count == 2
+    assert store_factory.delete_calls == []
+    assert store_factory.delete_namespace_calls == []
+
+
+def test_embedding_or_pipeline_exception_does_not_trigger_cleanup() -> None:
+    # The SDK reports failed upsert batches through the write count rather than raising, so a
+    # raised pipeline error (typically the embedder) comes with no evidence of committed
+    # chunks; deleting the deterministic ids could remove an identical, earlier upload.
+    store_factory = FakeStoreFactory()
+    service = _service_reporting_write_count(
+        0, store_factory, pipeline_exception=RuntimeError("embedder rate limited")
+    )
+
+    with pytest.raises(DocumentIngestionError):
+        service.ingest_and_summarize(_request())
+
+    assert store_factory.delete_calls == []
+
+
+def test_successful_ingestion_never_deletes_anything() -> None:
+    store_factory = FakeStoreFactory()
+    service = _service_reporting_write_count(
+        2,
+        store_factory,
+        summary_pipeline=FakePipelineRunner(
+            result={
+                "generator": {
+                    "replies": [ChatMessage.from_assistant(text="Документ описывает пилот Orion.")]
+                }
+            }
+        ),
+    )
+
+    outcome = service.ingest_and_summarize(_request())
+
+    assert outcome.summary == "Документ описывает пилот Orion."
+    assert outcome.documents_written == 2
+    assert store_factory.delete_calls == []
     assert store_factory.delete_namespace_calls == []

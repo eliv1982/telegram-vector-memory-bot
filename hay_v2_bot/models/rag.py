@@ -17,6 +17,11 @@ from .documents import (
     validate_base_file_name,
 )
 
+# Placeholder text carried by a *fallback* DocumentAnswer (``fallback_used=True``), whose
+# ``answer`` field must be non-blank. It is never shown to the user and has no control-flow
+# role: routing between a document answer and the Agent is decided only by the validated
+# machine contract (see hay_v2_bot.components.answer_contract) and surfaced as
+# ``DocumentAnswer.fallback_used`` -- never by comparing model output with this sentence.
 INSUFFICIENT_DOCUMENT_ANSWER = "В загруженных документах недостаточно информации для ответа."
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -9,10 +10,14 @@ from haystack import Pipeline
 
 from hay_v2_bot.adapters import DoclingDocumentAdapter, DocumentAdapterError
 from hay_v2_bot.components import (
+    DocumentAnswerRejected,
+    RejectionReason,
     build_sources,
     build_summary_context,
+    document_label,
     extract_chat_reply_text,
     normalize_single_sentence_summary,
+    parse_document_answer,
 )
 from hay_v2_bot.config import DocumentProcessingSettings, DocumentRagSettings
 from hay_v2_bot.models import (
@@ -27,6 +32,12 @@ from hay_v2_bot.pipelines import (
     build_summary_pipeline,
 )
 from hay_v2_bot.storage import DocumentStoreError, PineconeDocumentStoreFactory
+
+logger = logging.getLogger(__name__)
+
+# Fallback reasons that are an expected outcome ("the documents do not answer this"),
+# as opposed to a malformed or unsafe generator reply, which is worth a warning.
+_EXPECTED_FALLBACK_REASONS = frozenset({"no_documents", RejectionReason.NOT_ANSWERABLE})
 
 
 class DocumentRagServiceError(Exception):
@@ -122,6 +133,13 @@ class DocumentRagService:
         except DocumentIngestionError as exc:
             raise DocumentIngestionError(str(exc), document_ids=document_ids) from exc
         if documents_written != conversion_result.chunk_count:
+            # The Pinecone SDK reports failed upsert batches through a short write count
+            # instead of raising, so earlier batches may already be committed. They are
+            # deliberately left in place: chunk ids are derived from the file content, so
+            # the same ids can belong to an earlier, complete upload of an identical file,
+            # and deleting them would destroy that data. The upload is reported as failed
+            # (never as indexed); re-sending the file re-upserts the same ids with
+            # DuplicatePolicy.OVERWRITE and completes the document.
             raise DocumentIngestionError(
                 "Document store reported an unexpected write count",
                 document_ids=document_ids,
@@ -180,30 +198,39 @@ class DocumentRagService:
             retrieval_result = retriever.run(query_embedding=query_embedding)
             retrieved_documents = tuple(retrieval_result.get("documents", ()))
             if not retrieved_documents:
-                return DocumentAnswer(
-                    answer=INSUFFICIENT_DOCUMENT_ANSWER,
-                    sources=(),
-                    used_document_count=0,
-                    fallback_used=True,
-                )
+                return _fallback_answer("no_documents")
+
+            # Per-request ids the model must cite (DOC_1, DOC_2, ...), in retrieval order.
+            # They map back to exactly the documents that were put into the prompt.
+            documents_by_label = {
+                document_label(position): document
+                for position, document in enumerate(retrieved_documents, start=1)
+            }
 
             prompt_result = prompt_builder.run(
                 question=normalized_question,
                 documents=list(retrieved_documents),
             )
             generator_result = generator.run(messages=prompt_result["prompt"])
-            answer_text = extract_chat_reply_text(generator_result.get("replies", ()))
-            sources = build_sources(retrieved_documents)
+            reply_text = extract_chat_reply_text(generator_result.get("replies", ()))
+
+            try:
+                parsed = parse_document_answer(reply_text, documents_by_label)
+            except DocumentAnswerRejected as rejected:
+                return _fallback_answer(rejected.reason)
+
+            # Only chunks the model cited, and that were really supplied, become sources.
+            sources = build_sources([documents_by_label[label] for label in parsed.source_labels])
         except DocumentRagServiceError:
             raise
         except Exception as exc:
             raise DocumentQuestionError("Question answering failed") from exc
 
         return DocumentAnswer(
-            answer=answer_text,
+            answer=parsed.answer,
             sources=sources,
             used_document_count=len(sources),
-            fallback_used=answer_text == INSUFFICIENT_DOCUMENT_ANSWER,
+            fallback_used=False,
         )
 
     def delete_documents(self, user_id: int, document_ids: Sequence[str]) -> None:
@@ -227,6 +254,22 @@ class DocumentRagService:
             self._document_store_factory.delete_user_namespace(user_id)
         except DocumentStoreError as exc:
             raise DocumentRagServiceError("Document cleanup failed") from exc
+
+
+def _fallback_answer(reason: str) -> DocumentAnswer:
+    """Signal "no usable document answer": the caller must fall back to the Agent.
+
+    The placeholder ``answer`` is never shown to the user; routing reads ``fallback_used``.
+    Only a fixed reason code is logged -- never model output, which may echo user data.
+    """
+    level = logging.INFO if reason in _EXPECTED_FALLBACK_REASONS else logging.WARNING
+    logger.log(level, "event=document_answer_fallback reason=%s", reason)
+    return DocumentAnswer(
+        answer=INSUFFICIENT_DOCUMENT_ANSWER,
+        sources=(),
+        used_document_count=0,
+        fallback_used=True,
+    )
 
 
 def _validate_user_id(user_id: int) -> int:

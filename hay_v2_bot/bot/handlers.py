@@ -13,8 +13,10 @@ from typing import Any, Final
 
 from aiogram import Dispatcher, F, Router
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
+from aiohttp import ClientError
 from pydantic import ValidationError
 
 from hay_v2_bot.bot.messages import (
@@ -26,6 +28,7 @@ from hay_v2_bot.bot.messages import (
     NON_TEXT_MESSAGE,
     PROCESSING_FAILURE_MESSAGE,
     START_MESSAGE,
+    SUMMARY_UNAVAILABLE_MESSAGE,
     UNKNOWN_COMMAND_MESSAGE,
     UNSUPPORTED_DOCUMENT_MESSAGE,
     UPLOAD_COMPLETED_MESSAGE,
@@ -195,8 +198,24 @@ async def handle_document_upload(
                 uploaded_at=datetime.now(UTC),
             )
             outcome = await asyncio.to_thread(document_rag_service.ingest_and_summarize, request)
+    except DocumentSummaryError as exc:
+        # Raised only after every chunk was written and the write count verified, so the
+        # document is indexed and usable; only the optional summary is missing. Telling
+        # the user the whole upload failed would be untrue (and nothing is deleted).
+        _log_safe_warning("document_summary_failed", exc)
+        await _send_text_chunks(message, SUMMARY_UNAVAILABLE_MESSAGE)
+        return
     except _KNOWN_UPLOAD_FAILURES as exc:
         _log_safe_warning("document_upload_failed", exc)
+        await _send_text_chunks(message, PROCESSING_FAILURE_MESSAGE)
+        return
+    except Exception as exc:
+        # Last-resort boundary, deliberately after every specific branch. The user has
+        # already been told the analysis started, so an unforeseen error must still end in
+        # one fixed message instead of silence (aiogram would only log it). Only the error
+        # type is logged and nothing from the exception reaches the user; BaseException
+        # (cancellation, shutdown) is intentionally not caught.
+        _log_safe_warning("document_upload_unexpected_failure", exc)
         await _send_text_chunks(message, PROCESSING_FAILURE_MESSAGE)
         return
 
@@ -428,12 +447,18 @@ class _UploadRejected(Exception):
         self.reply_text = reply_text
 
 
+# Everything the upload boundary can see without it being a bug: service failures, local
+# file errors, and Telegram download failures. ``bot.download`` raises TelegramAPIError
+# subclasses (including TelegramNetworkError) from ``get_file``, but the file stream itself
+# is not wrapped by aiogram, so raw aiohttp errors escape from it; OSError (which already
+# covers TimeoutError and aiohttp.ClientOSError) does not include aiohttp.ClientError.
 _KNOWN_UPLOAD_FAILURES = (
     DocumentIngestionError,
-    DocumentSummaryError,
     DocumentRagServiceError,
     OSError,
     ValidationError,
+    TelegramAPIError,
+    ClientError,
 )
 
 
